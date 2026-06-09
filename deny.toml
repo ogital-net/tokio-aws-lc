@@ -1,0 +1,40 @@
+# cargo-deny configuration. Run `cargo deny check` locally; CI mirrors the
+# same invocation. The dependency tree is intentionally small (aws-lc-sys +
+# tokio by default) so this file mostly enforces license discipline and
+# pins one source for crates.io.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# License posture for tokio-aws-lc and the AWS-LC ecosystem. BSD-2-Clause is
+# our own crate's license; Apache-2.0 / MIT / ISC cover the standard async
+# Rust dependency tree. Add to this list with a code review and a
+# justification.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

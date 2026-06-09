@@ -1,0 +1,51 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: publish to crates.io
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          manifest="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          if [ "$tag" != "$manifest" ]; then
+            echo "::error::Tag version ($tag) does not match Cargo.toml version ($manifest)"
+            exit 1
+          fi
+
+      # Mirror the gates CI already runs on tagged commits, so a green
+      # tag push genuinely means "publishable".
+      - name: Test (all features)
+        run: cargo test --all-features --verbose
+
+      - name: Test (no default features)
+        run: cargo test --no-default-features --verbose
+
+      - name: Doc tests
+        run: cargo test --doc --all-features
+
+      - name: Dry-run package
+        run: cargo package --verbose
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --verbose

@@ -1,0 +1,122 @@
+[package]
+name = "tokio-aws-lc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "BSD-2-Clause"
+readme = "README.md"
+description = "Tokio-friendly TLS server and client built directly on aws-lc-sys, with optional Linux kTLS offload."
+repository = "https://github.com/ogital-net/tokio-aws-lc"
+keywords = ["tls", "tokio", "aws-lc", "ktls", "async"]
+categories = ["network-programming", "asynchronous", "cryptography"]
+# Explicit allowlist for `cargo package`. Anything not listed here is
+# excluded from the published crate; new top-level files (CI config,
+# devcontainer, internal docs, scratch dirs) don't sneak in.
+include = [
+    "src/**/*.rs",
+    "examples/**/*.rs",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+]
+
+# docs.rs builds with `--all-features` so the optional `hyper` adapters
+# (and any kTLS surface visible on Linux) show up in the rendered docs,
+# and tags feature-gated items with the feature label.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[features]
+default = []
+# `hyper` integration: server-side acceptor adapter and client-side
+# `tower::Service<Uri>` connector for `hyper` 1.x via `hyper-util`. Off
+# by default. Mirrors the dependency shape of `hyper-rustls`: pulls
+# `hyper-util` (client-legacy + tokio), `tower-service` for the
+# connector trait, and `http` for the `Uri` type. `hyper` itself comes
+# in transitively via `hyper-util/client-legacy`.
+hyper = ["dep:hyper-util", "dep:tower-service", "dep:http"]
+
+[dependencies]
+# `ssl` enables aws-lc-sys's libssl bindings (SSL_CTX, SSL, TLS_method, …).
+# The default crate ships libcrypto only, which is not enough for our public
+# API. Pulling `ssl` triggers a bindgen build step the first time aws-lc-sys
+# is compiled on this host.
+# Version: floor at the release we built and tested against, ceiling
+# below 2.0. aws-lc-sys is a thin shim over an OpenSSL-1.1-shaped C
+# API and has been API-stable across its 0.x line in practice
+aws-lc-sys = { version = ">=0.40, <2", features = ["ssl"] }
+# `net` for TcpStream + Interest, `io-util` for ReadBuf + the AsyncRead/
+# Write ext traits.
+tokio = { version = "1", features = ["net", "io-util"] }
+
+# Feature-gated. Tracks the current major release line; we do not ship
+# adapters for the legacy `hyper` 0.14 line.
+http = { version = "1", optional = true }
+hyper-util = { version = "0.1", default-features = false, features = [
+    "tokio",
+    "client-legacy",
+], optional = true }
+tower-service = { version = "0.3", optional = true }
+
+[dev-dependencies]
+# Test/bench/example harness: `macros` for #[tokio::test] and
+# #[tokio::main]; `rt-multi-thread` for the bench runtime + example
+# binaries (also implies `rt`, which #[tokio::test] and tokio::spawn
+# need); `process` for shelling out to `openssl s_client` in
+# tests/server_roundtrip.rs.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process"] }
+# Dev-only support for the hyper integration tests. Pulled regardless of
+# feature flag — cargo dev-dep features still cost nothing at the
+# library's runtime, and the `--features hyper` test job is the only one
+# that activates the test files which use them.
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1", features = [
+    "tokio",
+    "server-auto",
+    "client-legacy",
+    "http1",
+    "http2",
+] }
+http-body-util = "0.1"
+bytes = "1"
+# Bench-only. `criterion` drives the harness; `tokio-rustls` is the
+# A/B target for comparing our overhead against `rustls` over the same
+# AWS-LC libcrypto (rustls's default `aws-lc-rs` provider depends on
+# `aws-lc-sys`, so the underlying primitives are identical). `rustls`
+# is pulled in only so we can construct its server/client config and
+# trust-anchor types from the same PEM fixtures the round-trip tests
+# already use; we do not depend on its public surface from `src/`.
+criterion = { version = "0.5", features = ["async_tokio"] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "aws-lc-rs",
+    "tls12",
+] }
+
+[[bench]]
+name = "handshake"
+harness = false
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)'] }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[[example]]
+name = "hyper-server"
+required-features = ["hyper"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
