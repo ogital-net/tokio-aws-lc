@@ -61,7 +61,7 @@ not the semantics.
 
 ## Status
 
-Pre-release (`0.1.0`).
+Pre-release (`0.2.0`).
 
 | Surface | State |
 | --- | --- |
@@ -78,14 +78,14 @@ Windows.
 
 ```toml
 [dependencies]
-tokio-aws-lc = "0.1"
+tokio-aws-lc = "0.2"
 ```
 
 The default build pulls only `aws-lc-sys` and `tokio`. The `hyper`
 adapters are opt-in:
 
 ```toml
-tokio-aws-lc = { version = "0.1", features = ["hyper"] }
+tokio-aws-lc = { version = "0.2", features = ["hyper"] }
 ```
 
 Build prerequisites are whatever `aws-lc-sys` itself needs: `cmake`,
