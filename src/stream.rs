@@ -155,7 +155,20 @@ impl TlsStream {
         if self.ktls_active || self.ktls_disabled {
             return Ok(());
         }
-        crate::ktls::check_no_buffered_plaintext(&self.ssl)?;
+        // Buffered (decrypted or undecrypted) data at install time is a
+        // transient, timing-dependent condition — not a structural
+        // "kTLS unavailable" one — so treat it like the other non-fatal
+        // cases below: skip the install and let the connection proceed
+        // on the userspace AEAD path, where libssl reads the buffered
+        // bytes correctly. Failing the whole connection here would drop
+        // clients whose first record merely coalesced with the
+        // handshake's final TCP segment.
+        if let Err(e) = crate::ktls::check_no_buffered_plaintext(&self.ssl) {
+            match e {
+                Error::Ktls(KtlsError::BufferedPlaintext(_)) => return Ok(()),
+                other => return Err(other),
+            }
+        }
         let raw = self.tcp.as_raw_fd();
         match crate::ktls::install_ktls(&self.ssl, raw) {
             Ok(()) => {

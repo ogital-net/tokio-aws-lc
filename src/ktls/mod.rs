@@ -213,15 +213,35 @@ fn derive_crypto_info(ssl: &Ssl, cipher: KtlsCipher) -> Result<CryptoInfo> {
     }
 }
 
-/// Verify libssl has no buffered plaintext that the kernel would miss
-/// after install (it would be silently dropped because the kernel takes
-/// over the read path).
+/// Verify libssl has no buffered data that the kernel would miss after
+/// install (it would be silently dropped because the kernel takes over
+/// the read path).
+///
+/// Uses `SSL_has_pending`, not `SSL_pending`: the latter only counts
+/// already-*decrypted* bytes, so it returns 0 in the dangerous case
+/// where the peer's first application record was coalesced into the
+/// same TCP segment as the handshake `Finished`. `SSL_do_handshake`
+/// pulls that whole segment off the socket into libssl's BIO, leaving
+/// the trailing application record buffered but still *undecrypted* —
+/// `SSL_pending` reports 0 while the bytes are sitting in libssl, about
+/// to be stranded once the kernel owns the fd. `SSL_has_pending` also
+/// reports buffered-but-undecrypted transport data, so it catches this.
+///
+/// NB: this crate never enables read-ahead (`SSL_set_read_ahead` /
+/// `SSL_CTX_set_read_ahead`), so `SSL_has_pending` cannot spuriously
+/// fire on a partial undecryptable record here — a non-zero result
+/// always means real bytes the kernel would miss.
 pub(crate) fn check_no_buffered_plaintext(ssl: &Ssl) -> Result<()> {
     // SAFETY: ssl is live.
-    let pending = unsafe { aws_lc_sys::SSL_pending(ssl.as_ptr()) };
-    if pending > 0 {
+    let has_pending = unsafe { aws_lc_sys::SSL_has_pending(ssl.as_ptr()) };
+    if has_pending != 0 {
+        // `SSL_pending` gives the decrypted-byte count for diagnostics;
+        // it may legitimately be 0 here when only undecrypted transport
+        // data is buffered (the coalesced-record case above).
+        // SAFETY: ssl is live.
+        let pending = unsafe { aws_lc_sys::SSL_pending(ssl.as_ptr()) };
         #[allow(clippy::cast_sign_loss)]
-        let n = pending as usize;
+        let n = pending.max(0) as usize;
         return Err(Error::Ktls(KtlsError::BufferedPlaintext(n)));
     }
     Ok(())

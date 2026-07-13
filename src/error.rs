@@ -40,11 +40,15 @@ pub enum KtlsError {
     Unsupported,
     /// Negotiated cipher / TLS version cannot be offloaded.
     IneligibleCipher { tls_version: String, cipher: String },
-    /// libssl has decrypted plaintext sitting in its internal buffer
-    /// at the moment of install. Installing kTLS now would silently
-    /// drop those bytes because the kernel takes over the read path
-    /// and only sees what arrives on the wire afterwards. The payload
-    /// is the number of bytes libssl had buffered.
+    /// libssl has buffered data — decrypted plaintext, or undecrypted
+    /// transport bytes (e.g. the peer's first application record
+    /// coalesced into the handshake's final TCP segment) — sitting in
+    /// its internal buffer at the moment of install. Installing kTLS
+    /// now would silently drop those bytes because the kernel takes
+    /// over the read path and only sees what arrives on the wire
+    /// afterwards. The payload is the number of *decrypted* bytes
+    /// libssl had buffered (`SSL_pending`), which may be 0 when only
+    /// undecrypted transport data is present.
     BufferedPlaintext(usize),
     /// The kernel rejected `setsockopt(SOL_TCP, TCP_ULP, "tls")` with
     /// an errno that indicates the `tls` Upper Layer Protocol is not
