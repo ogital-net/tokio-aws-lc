@@ -3,7 +3,7 @@
 {
 	"name": "Rust",
 	// Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
-	"image": "mcr.microsoft.com/devcontainers/rust:2-1-trixie"
+	"image": "mcr.microsoft.com/devcontainers/rust:2-1-trixie",
 
 	// Use 'mounts' to make the cargo cache persistent in a Docker Volume.
 	// "mounts": [
@@ -20,8 +20,10 @@
 	// Use 'forwardPorts' to make a list of ports inside the container available locally.
 	// "forwardPorts": [],
 
-	// Use 'postCreateCommand' to run commands after the container is created.
-	// "postCreateCommand": "rustc --version",
+	// Install the native build dependencies required by aws-lc-sys (cmake, a C/C++
+	// toolchain, perl for the AWS-LC assembly perlasm scripts, nasm for x86/x86_64
+	// assembly, and libclang/clang for bindgen) after the container is created.
+	"postCreateCommand": "sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake build-essential perl nasm clang libclang-dev pkg-config && rustc --version",
 
 	// Configure tool-specific properties.
 	// "customizations": {},
