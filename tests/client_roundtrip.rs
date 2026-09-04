@@ -133,9 +133,8 @@ async fn shutdown_survives_peer_dropping_socket_without_close_notify() {
             .write_all(b"last message before close")
             .await
             .expect("server write");
-        // Wait until the client has confirmed its socket is already
-        // aborted before attempting our own shutdown -- this is what
-        // makes the race deterministic instead of scheduling-dependent.
+        // Wait for the client to abort its TCP socket before shutting
+        // down, so the server observes a deterministic EOF race.
         peer_gone_rx.await.expect("client signaled abort");
         stream
             .shutdown()
@@ -147,8 +146,8 @@ async fn shutdown_survives_peer_dropping_socket_without_close_notify() {
         let tcp = TcpStream::connect(("127.0.0.1", port))
             .await
             .expect("tcp connect");
-        // Force an abortive close (RST) on drop instead of the normal
-        // FIN/ACK teardown.
+        // SO_LINGER=0 turns the drop below into a TCP RST, so the peer
+        // observes an EOF before any close_notify is sent.
         tcp.set_zero_linger().expect("set SO_LINGER=0");
         let mut stream = connector
             .connect("localhost", tcp)
@@ -157,8 +156,7 @@ async fn shutdown_survives_peer_dropping_socket_without_close_notify() {
         let mut buf = [0u8; 64];
         let n = stream.read(&mut buf).await.expect("client read");
         assert_eq!(&buf[..n], b"last message before close");
-        // Drop without calling `shutdown()` -- the underlying TcpStream
-        // is aborted (RST) on drop, with no close_notify sent.
+        // Drop without shutdown so the RST fires immediately.
         drop(stream);
         // Give the RST a moment to actually leave the kernel's send
         // queue before telling the server it's safe to proceed.
