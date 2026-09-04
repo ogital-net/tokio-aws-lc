@@ -1,4 +1,4 @@
-//! M3 in-process round-trips: drive a real `TlsAcceptor` against a real
+//! in-process round-trips: drive a real `TlsAcceptor` against a real
 //! `TlsConnector` over a loopback TCP socket. Covers the plain server-
 //! auth path and the mutual-TLS path.
 
@@ -102,6 +102,72 @@ async fn server_and_client_round_trip_in_process() {
     // RFC 5705: both sides derive the same exporter output.
     assert_eq!(server_ekm_no_ctx, client_ekm_no_ctx);
     assert_eq!(server_ekm_ctx, client_ekm_ctx);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_survives_peer_dropping_socket_without_close_notify() {
+    let server_cfg = Arc::new(
+        ServerConfig::builder()
+            .with_pem_bytes(CERT_PEM, KEY_PEM)
+            .expect("ServerConfig builds"),
+    );
+    let acceptor = TlsAcceptor::new(server_cfg);
+
+    let client_cfg = Arc::new(
+        ClientConfig::builder()
+            .with_root_certs_pem_bytes(CERT_PEM)
+            .build()
+            .expect("ClientConfig builds"),
+    );
+    let connector = TlsConnector::new(client_cfg);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let (peer_gone_tx, peer_gone_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut stream = acceptor.accept(tcp).await.expect("server handshake");
+        stream
+            .write_all(b"last message before close")
+            .await
+            .expect("server write");
+        // Wait until the client has confirmed its socket is already
+        // aborted before attempting our own shutdown -- this is what
+        // makes the race deterministic instead of scheduling-dependent.
+        peer_gone_rx.await.expect("client signaled abort");
+        stream
+            .shutdown()
+            .await
+            .expect("server shutdown must succeed");
+    });
+
+    let client = tokio::spawn(async move {
+        let tcp = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp connect");
+        // Force an abortive close (RST) on drop instead of the normal
+        // FIN/ACK teardown.
+        tcp.set_zero_linger().expect("set SO_LINGER=0");
+        let mut stream = connector
+            .connect("localhost", tcp)
+            .await
+            .expect("client handshake");
+        let mut buf = [0u8; 64];
+        let n = stream.read(&mut buf).await.expect("client read");
+        assert_eq!(&buf[..n], b"last message before close");
+        // Drop without calling `shutdown()` -- the underlying TcpStream
+        // is aborted (RST) on drop, with no close_notify sent.
+        drop(stream);
+        // Give the RST a moment to actually leave the kernel's send
+        // queue before telling the server it's safe to proceed.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let _ = peer_gone_tx.send(());
+    });
+
+    client.await.expect("client task");
+    server.await.expect("server task");
 }
 
 #[tokio::test]

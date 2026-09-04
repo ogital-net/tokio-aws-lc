@@ -66,7 +66,13 @@ tower-service = { version = "0.3", optional = true }
 # binaries (also implies `rt`, which #[tokio::test] and tokio::spawn
 # need); `process` for shelling out to `openssl s_client` in
 # tests/server_roundtrip.rs.
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process"] }
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "process",
+    "sync",
+    "time",
+] }
 # Dev-only support for the hyper integration tests. Pulled regardless of
 # feature flag — cargo dev-dep features still cost nothing at the
 # library's runtime, and the `--features hyper` test job is the only one

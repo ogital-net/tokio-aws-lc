@@ -170,12 +170,23 @@ pub fn last_error() -> String {
     if code == 0 {
         return "(no error queued)".into();
     }
+    format_and_clear(code)
+}
 
+/// Render a single already-fetched packed error code to a human-readable
+/// string, then drain any remaining queue entries so they cannot leak into
+/// the next call.
+///
+/// Shared by [`last_error`] (formats whatever `ERR_get_error` pops) and
+/// [`pem_eof_or_err`] (formats the exact entry it just classified via
+/// `ERR_peek_last_error`, rather than popping a possibly-different entry
+/// off the front of the queue).
+fn format_and_clear(code: u32) -> String {
     let mut buf = [0u8; 256];
     // SAFETY: `buf` describes a writable slice of `buf.len()` bytes.
     // `ERR_error_string_n` writes a NUL-terminated string of at most `len`
-    // bytes (truncating if necessary). `code` is the value we just pulled
-    // off the queue.
+    // bytes (truncating if necessary). `code` is a packed error value the
+    // caller already obtained from the thread-local error queue.
     unsafe {
         aws_lc_sys::ERR_error_string_n(code, buf.as_mut_ptr().cast(), buf.len());
     }
@@ -195,7 +206,8 @@ pub fn last_error() -> String {
 /// (`(ERR_LIB_PEM, PEM_R_NO_START_LINE)`) or a real parse failure.
 ///
 /// On EOF: drains the queue and returns `Ok(())`. On any other error:
-/// drains the queue via [`last_error`] and returns
+/// formats and drains the same entry just classified (via
+/// `ERR_peek_last_error`) and returns
 /// `Err(Error::Init(format!("{label}: {detail}")))` so a corrupt
 /// trailing certificate cannot be silently treated as "end of bundle".
 pub(crate) fn pem_eof_or_err(label: &str) -> Result<()> {
@@ -221,7 +233,16 @@ pub(crate) fn pem_eof_or_err(label: &str) -> Result<()> {
         }
         Ok(())
     } else {
-        Err(Error::Init(format!("{label}: {}", last_error())))
+        // Format the exact entry we just classified (`packed`, from
+        // `ERR_peek_last_error`) instead of calling `last_error()`, which
+        // pops via `ERR_get_error` (the *oldest* queued entry). If more
+        // than one error was pushed for this failure the two would
+        // disagree, reporting an unrelated error message for the very
+        // entry we just decided was non-benign.
+        Err(Error::Init(format!(
+            "{label}: {}",
+            format_and_clear(packed)
+        )))
     }
 }
 

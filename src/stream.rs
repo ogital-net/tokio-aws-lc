@@ -352,6 +352,27 @@ impl AsyncWrite for TlsStream {
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     Poll::Pending => return Poll::Pending,
                 },
+                // SSL_ERROR_ZERO_RETURN: the peer's close_notify was already
+                // visible before our own finished sending -- from our side
+                // the session is closed either way.
+                //
+                // SSL_ERROR_SYSCALL: AWS-LC's ssl.h documents this
+                // explicitly -- "SSL_ERROR_SYSCALL ... may also be signaled
+                // if the transport returned EOF". This fires whenever the
+                // peer has already torn down the TCP connection (FIN/RST)
+                // before or during our attempt to send our own
+                // close_notify -- an ordinary, frequent race whenever the
+                // peer disconnects promptly after it has no more use for
+                // the connection (e.g. an HTTP/2 client closing its pooled
+                // connection right after the last response). By the time
+                // shutdown runs, all application data has already been
+                // exchanged, so a peer that's simply gone is not a failure
+                // worth surfacing here -- treat the shutdown as complete,
+                // the same way tokio-rustls and other TLS stacks handle
+                // this exact race.
+                aws_lc_sys::SSL_ERROR_ZERO_RETURN | aws_lc_sys::SSL_ERROR_SYSCALL => {
+                    return Poll::Ready(Ok(()));
+                }
                 _ => return Poll::Ready(Err(ssl_io_error("SSL_shutdown", err))),
             }
         }
