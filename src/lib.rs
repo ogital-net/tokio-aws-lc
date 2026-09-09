@@ -1,5 +1,5 @@
 #![doc = include_str!("../README.md")]
-#![doc(html_root_url = "https://docs.rs/tokio-aws-lc/0.2.0")]
+#![doc(html_root_url = "https://docs.rs/tokio-aws-lc/0.3.0")]
 
 pub mod acceptor;
 pub mod config;

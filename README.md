@@ -60,7 +60,7 @@ builder API hides the FFI but not the semantics.
 
 ## Status
 
-Pre-release (`0.2.0`).
+Pre-release (`0.3.0`).
 
 | Surface | State |
 | --- | --- |
@@ -69,7 +69,7 @@ Pre-release (`0.2.0`).
 | Linux kTLS (`TLS_TX` + `TLS_RX`) | TLS 1.3 (AES-128/256-GCM, ChaCha20-Poly1305) and TLS 1.2 AEAD; integration-tested via `/proc/net/tls_stat`. |
 | Optional `hyper` integration | Server acceptor + `tower::Service<Uri>` client connector for `hyper` 1.x. |
 
-Not in `0.2`: session resumption, `UnixStream`, BIO-pair fallback for
+Not in `0.3`: session resumption, `UnixStream`, BIO-pair fallback for
 arbitrary IO, post-attach handshake controls (including TLS 1.3
 `NewSessionTicket` and `KeyUpdate`), `tracing` instrumentation, Windows.
 
@@ -77,14 +77,14 @@ arbitrary IO, post-attach handshake controls (including TLS 1.3
 
 ```toml
 [dependencies]
-tokio-aws-lc = "0.2"
+tokio-aws-lc = "0.3"
 ```
 
 The default build's direct runtime dependencies are `aws-lc-sys`,
 `tokio`, and, on Linux only, `libc`. The `hyper` adapters are opt-in:
 
 ```toml
-tokio-aws-lc = { version = "0.2", features = ["hyper"] }
+tokio-aws-lc = { version = "0.3", features = ["hyper"] }
 ```
 
 Build prerequisites are whatever `aws-lc-sys` itself needs: `cmake`,
