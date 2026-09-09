@@ -2,7 +2,9 @@
 //!
 //! Exercises:
 //! - HTTP/1.1 round-trip through `HyperAcceptor` + `HttpsConnector`.
-//! - HTTP/2 round-trip via ALPN-negotiated h2.
+//! - IPv4 and IPv6 literal URIs with IP-SAN certificate verification.
+//! - HTTP/2 round-trips with forced h2 and automatic ALPN selection.
+//! - HTTP/1.1 fallback when the server does not advertise h2.
 //! - Linux-only: kTLS install on a hyper-served `TlsStream` still serves
 //!   plaintext HTTP correctly.
 
@@ -15,7 +17,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
-use hyper::{Request, Response, Uri};
+use hyper::{Request, Response, Uri, Version};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 #[cfg(target_os = "linux")]
@@ -27,6 +29,8 @@ use tokio_aws_lc::{ClientConfig, ServerConfig, TlsAcceptor, TlsConnector};
 
 const CERT_PEM: &[u8] = include_bytes!("data/cert.pem");
 const KEY_PEM: &[u8] = include_bytes!("data/key.pem");
+// Uses the same key, but has only an ::1 IP SAN (no DNS SAN).
+const IPV6_CERT_PEM: &[u8] = include_bytes!("data/cert-ipv6.pem");
 const BODY: &[u8] = b"hello from hyper over tokio-aws-lc";
 
 async fn echo(_req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
@@ -54,9 +58,25 @@ fn client_connector(alpn: &[&[u8]]) -> HttpsConnector {
     HttpsConnector::new(TlsConnector::new(cfg))
 }
 
-async fn run_roundtrip(alpn: &[&[u8]], force_http2: bool) -> Vec<u8> {
-    let acceptor = server_acceptor(alpn);
+async fn run_roundtrip(alpn: &[&[u8]], force_http2: bool) -> (Version, Vec<u8>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    run_roundtrip_on(
+        listener,
+        "localhost",
+        server_acceptor(alpn),
+        client_connector(alpn),
+        force_http2,
+    )
+    .await
+}
+
+async fn run_roundtrip_on(
+    listener: TcpListener,
+    host: &str,
+    acceptor: HyperAcceptor,
+    connector: HttpsConnector,
+    force_http2: bool,
+) -> (Version, Vec<u8>) {
     let port = listener.local_addr().unwrap().port();
 
     let server = tokio::spawn(async move {
@@ -68,19 +88,19 @@ async fn run_roundtrip(alpn: &[&[u8]], force_http2: bool) -> Vec<u8> {
             .expect("hyper serve");
     });
 
-    let connector = client_connector(alpn);
     let mut builder = Client::builder(TokioExecutor::new());
     if force_http2 {
         builder.http2_only(true);
     }
     let client: Client<HttpsConnector, Empty<Bytes>> = builder.build(connector);
 
-    let uri: Uri = format!("https://localhost:{port}/").parse().unwrap();
+    let uri: Uri = format!("https://{host}:{port}/").parse().unwrap();
     let req = Request::builder()
         .uri(uri)
         .body(Empty::<Bytes>::new())
         .unwrap();
     let resp = client.request(req).await.expect("client request");
+    let version = resp.version();
     let body = resp
         .into_body()
         .collect()
@@ -94,18 +114,116 @@ async fn run_roundtrip(alpn: &[&[u8]], force_http2: bool) -> Vec<u8> {
     // request and we deadlock on `server.await`.
     drop(client);
     server.await.unwrap();
-    body
+    (version, body)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hyper_roundtrip_http1() {
-    let body = run_roundtrip(&[b"http/1.1"], false).await;
+    let (version, body) = run_roundtrip(&[b"http/1.1"], false).await;
+    assert_eq!(version, Version::HTTP_11);
     assert_eq!(body, BODY);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hyper_roundtrip_http2() {
-    let body = run_roundtrip(&[b"h2"], true).await;
+    let (version, body) = run_roundtrip(&[b"h2"], true).await;
+    assert_eq!(version, Version::HTTP_2);
+    assert_eq!(body, BODY);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hyper_roundtrip_http2_via_alpn() {
+    // Leave the client in automatic mode: Connection::connected() must
+    // report the negotiated h2 ALPN for hyper to select HTTP/2.
+    let (version, body) = run_roundtrip(&[b"h2", b"http/1.1"], false).await;
+    assert_eq!(version, Version::HTTP_2);
+    assert_eq!(body, BODY);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hyper_roundtrip_alpn_falls_back_to_http1() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (version, body) = run_roundtrip_on(
+        listener,
+        "localhost",
+        server_acceptor(&[b"http/1.1"]),
+        client_connector(&[b"h2", b"http/1.1"]),
+        false,
+    )
+    .await;
+    assert_eq!(version, Version::HTTP_11);
+    assert_eq!(body, BODY);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hyper_roundtrip_ipv4_literal() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (version, body) = run_roundtrip_on(
+        listener,
+        "127.0.0.1",
+        server_acceptor(&[b"http/1.1"]),
+        client_connector(&[b"http/1.1"]),
+        false,
+    )
+    .await;
+    assert_eq!(version, Version::HTTP_11);
+    assert_eq!(body, BODY);
+}
+
+fn ipv6_loopback_unavailable(err: &std::io::Error) -> bool {
+    // EAFNOSUPPORT is not always mapped to Unsupported (e.g. on Linux).
+    // Use the platform's errno value rather than a hard-coded number.
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
+    ) || err.raw_os_error() == Some(libc::EAFNOSUPPORT)
+}
+
+#[test]
+fn ipv6_loopback_skip_only_unavailable_errors() {
+    use std::io::{Error, ErrorKind};
+
+    for (err, should_skip) in [
+        (Error::from(ErrorKind::AddrNotAvailable), true),
+        (Error::from(ErrorKind::Unsupported), true),
+        (Error::from_raw_os_error(libc::EAFNOSUPPORT), true),
+        (Error::from(ErrorKind::AddrInUse), false),
+        (Error::from(ErrorKind::PermissionDenied), false),
+        (Error::from_raw_os_error(libc::EMFILE), false),
+        (Error::other("unexpected bind failure"), false),
+    ] {
+        assert_eq!(ipv6_loopback_unavailable(&err), should_skip, "{err:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hyper_roundtrip_ipv6_literal() {
+    let listener = match TcpListener::bind("[::1]:0").await {
+        Ok(listener) => listener,
+        Err(err) if ipv6_loopback_unavailable(&err) => {
+            eprintln!("IPv6 loopback unavailable; skipping: {err}");
+            return;
+        }
+        Err(err) => panic!("bind IPv6 loopback: {err}"),
+    };
+    let server_cfg = ServerConfig::builder()
+        .alpn_protocols(&[b"http/1.1"])
+        .with_pem_bytes(IPV6_CERT_PEM, KEY_PEM)
+        .expect("IPv6 ServerConfig builds");
+    let client_cfg = ClientConfig::builder()
+        .with_root_certs_pem_bytes(IPV6_CERT_PEM)
+        .alpn_protocols(&[b"http/1.1"])
+        .build()
+        .expect("IPv6 ClientConfig builds");
+    let (version, body) = run_roundtrip_on(
+        listener,
+        "[::1]",
+        HyperAcceptor::new(TlsAcceptor::new(server_cfg)),
+        HttpsConnector::new(TlsConnector::new(client_cfg)),
+        false,
+    )
+    .await;
+    assert_eq!(version, Version::HTTP_11);
     assert_eq!(body, BODY);
 }
 

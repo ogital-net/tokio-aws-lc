@@ -145,6 +145,12 @@ impl Service<Uri> for HttpsConnector {
                 )));
             }
             let host = host.ok_or_else(|| io::Error::other("URI is missing a host"))?;
+            // Uri::host() retains IPv6 brackets, but TlsConnector expects
+            // a bare IP literal to select IP-SAN verification and omit SNI.
+            let host = host
+                .strip_prefix('[')
+                .and_then(|host| host.strip_suffix(']'))
+                .unwrap_or(&host);
 
             // TCP step via hyper-util's HttpConnector, then unwrap back
             // to a plain TcpStream for our connector.
@@ -154,7 +160,7 @@ impl Service<Uri> for HttpsConnector {
             let tcp = tcp_io.into_inner();
 
             // TLS step.
-            let tls_stream = tls.connect(&host, tcp).await.map_err(io::Error::other)?;
+            let tls_stream = tls.connect(host, tcp).await.map_err(io::Error::other)?;
             Ok(TokioIo::new(tls_stream))
         })
     }

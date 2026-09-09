@@ -87,6 +87,8 @@ hyper-util = { version = "0.1", features = [
 ] }
 http-body-util = "0.1"
 bytes = "1"
+# Platform errno constants for the IPv6 test's availability check.
+libc = "0.2"
 # Bench-only. `criterion` drives the harness; `tokio-rustls` is the
 # A/B target for comparing our overhead against `rustls` over the same
 # AWS-LC libcrypto (rustls's default `aws-lc-rs` provider depends on
