@@ -11,7 +11,8 @@ use std::io;
 use std::os::fd::AsRawFd as _;
 use std::os::raw::c_int;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex};
+use std::task::{ready, Context, Poll, Wake, Waker};
 
 use tokio::io::{AsyncRead, AsyncWrite, Interest, ReadBuf};
 use tokio::net::TcpStream;
@@ -20,12 +21,59 @@ use crate::error::{last_error, Error, KtlsError, Result};
 use crate::ffi::Ssl;
 use crate::session::{export_keying_material, KtlsEligibility, NegotiatedSession};
 
+const MAX_PLAINTEXT: usize = 16 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shutdown {
+    Open,
+    Sending,
+    Closed,
+}
+
+// SSL reads can need write readiness and vice versa. Tokio keeps only
+// one waker per socket direction, so split halves must share a wakeup.
+// Allocated lazily; successful I/O never locks or creates a waker.
+#[derive(Default)]
+struct IoWaiters(Mutex<[Option<Waker>; 2]>);
+
+impl IoWaiters {
+    fn register(&self, reader: bool, waker: &Waker) {
+        let mut slots = self.0.lock().expect("I/O waker lock poisoned");
+        let slot = &mut slots[usize::from(reader)];
+        if !slot.as_ref().is_some_and(|old| old.will_wake(waker)) {
+            *slot = Some(waker.clone());
+        }
+    }
+
+    fn notify(&self) {
+        let slots = std::mem::take(&mut *self.0.lock().expect("I/O waker lock poisoned"));
+        for waker in slots.into_iter().flatten() {
+            waker.wake();
+        }
+    }
+}
+
+impl Wake for IoWaiters {
+    fn wake(self: Arc<Self>) {
+        self.notify();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.notify();
+    }
+}
+
 /// Established TLS session.
 ///
 /// Created by [`crate::TlsAcceptor::accept`] (server) or
 /// [`crate::TlsConnector::connect`] (client). Implements `AsyncRead` +
 /// `AsyncWrite`; errors surface as plain [`io::Error`] so framed codecs
 /// and `tokio::io::copy` work without conversion.
+///
+/// Userspace writes normally go directly to AWS-LC. Under backpressure,
+/// at most one 16 KiB plaintext chunk is buffered and reported as accepted.
+/// Call `flush()` or `shutdown()` to finish sending it. A write returning
+/// `Pending` has not accepted any bytes from that call's buffer.
 pub struct TlsStream {
     // Field order matters for Drop: `ssl` first (frees the SSL, which
     // drops one refcount on the SSL_CTX — the CTX-owned ALPN buffer
@@ -43,6 +91,13 @@ pub struct TlsStream {
     /// When `true`, automatic post-handshake install is skipped and
     /// the stream stays on the userspace AEAD path.
     ktls_disabled: bool,
+    /// Empty on the fast path. Capacity is reused after the first stall.
+    pending_write: Vec<u8>,
+    waiters: Option<Arc<IoWaiters>>,
+    write_error: Option<io::Error>,
+    shutdown: Shutdown,
+    #[cfg(target_os = "linux")]
+    ktls_reader: crate::ktls::io::RecordReader,
 }
 
 impl std::fmt::Debug for TlsStream {
@@ -61,12 +116,92 @@ unsafe impl Send for TlsStream {}
 
 impl TlsStream {
     pub(crate) fn from_parts(ssl: Ssl, tcp: TcpStream, ktls_disabled: bool) -> Self {
+        // SAFETY: exclusive, live SSL. A blocked write is copied into
+        // owned storage before returning; retries preserve bytes/length,
+        // but not the original caller's address. One record per call
+        // bounds both unreported writes and our slow-path allocation.
+        unsafe {
+            aws_lc_sys::SSL_set_mode(
+                ssl.as_ptr(),
+                u32::try_from(aws_lc_sys::SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER)
+                    .expect("SSL mode fits in u32"),
+            );
+        }
         Self {
             ssl,
             tcp,
             ktls_active: false,
             ktls_disabled,
+            pending_write: Vec::new(),
+            waiters: None,
+            write_error: None,
+            shutdown: Shutdown::Open,
+            #[cfg(target_os = "linux")]
+            ktls_reader: crate::ktls::io::RecordReader::default(),
         }
+    }
+
+    fn poll_ssl_ready(
+        &mut self,
+        code: c_int,
+        cx: &Context<'_>,
+        reader: bool,
+    ) -> Poll<io::Result<()>> {
+        let waiters = self
+            .waiters
+            .get_or_insert_with(|| Arc::new(IoWaiters::default()));
+        waiters.register(reader, cx.waker());
+        let waker = Waker::from(Arc::clone(waiters));
+        let mut shared = Context::from_waker(&waker);
+        if code == aws_lc_sys::SSL_ERROR_WANT_READ {
+            poll_clear_read_ready(&self.tcp, &mut shared)
+        } else {
+            poll_clear_write_ready(&self.tcp, &mut shared)
+        }
+    }
+
+    fn write_failure(&mut self, error: io::Error) -> io::Error {
+        self.write_error = Some(duplicate_io_error(&error));
+        if let Some(waiters) = &self.waiters {
+            waiters.notify();
+        }
+        error
+    }
+
+    fn poll_pending_write(&mut self, cx: &Context<'_>, reader: bool) -> Poll<io::Result<()>> {
+        if let Some(error) = &self.write_error {
+            return Poll::Ready(Err(duplicate_io_error(error)));
+        }
+        while !self.pending_write.is_empty() {
+            let len = c_int::try_from(self.pending_write.len()).expect("one TLS record");
+            // SAFETY: pending_write owns the identical plaintext of the
+            // blocked call. AWS-LC permits its new address via the mode
+            // set in from_parts. Partial-write mode is not enabled.
+            let n = unsafe {
+                aws_lc_sys::SSL_write(self.ssl.as_ptr(), self.pending_write.as_ptr().cast(), len)
+            };
+            if n == len {
+                self.pending_write.clear();
+                if let Some(waiters) = &self.waiters {
+                    waiters.notify();
+                }
+                break;
+            }
+            // SAFETY: immediately follows this SSL's failed operation.
+            let code = unsafe { aws_lc_sys::SSL_get_error(self.ssl.as_ptr(), n) };
+            if matches!(
+                code,
+                aws_lc_sys::SSL_ERROR_WANT_READ | aws_lc_sys::SSL_ERROR_WANT_WRITE
+            ) {
+                if let Err(error) = ready!(self.poll_ssl_ready(code, cx, reader)) {
+                    return Poll::Ready(Err(self.write_failure(error)));
+                }
+            } else {
+                let error = ssl_io_error("SSL_write", code);
+                return Poll::Ready(Err(self.write_failure(error)));
+            }
+        }
+        Poll::Ready(Ok(()))
     }
 
     /// Snapshot of the negotiated session: version, cipher, ALPN, SNI.
@@ -79,8 +214,8 @@ impl TlsStream {
 
     /// Whether the current session is structurally eligible for Linux
     /// kTLS offload. Does *not* check the host kernel; auto-install
-    /// runs on handshake completion and any kernel-side rejection
-    /// (missing `tls` ULP, etc.) is silently swallowed. Observe
+    /// runs on handshake completion. Rejections before either direction
+    /// is active fall back to userspace; partial installs fail closed. Observe
     /// [`Self::ktls_active`] to confirm whether the kernel actually
     /// took over the data path.
     #[must_use]
@@ -112,11 +247,11 @@ impl TlsStream {
     /// producing config opted out via `disable_ktls()`. Swallows the
     /// failure modes that indicate kTLS is structurally unavailable on
     /// this host / for this negotiation (`Unsupported`,
-    /// `IneligibleCipher`, `TlsUlpUnavailable`, `SocketUnattachable`)
+    /// `IneligibleCipher`, `TlsUlpUnavailable`, `SocketUnattachable`,
+    /// `CryptoUnavailable`)
     /// so the stream silently continues on the userspace path.
-    /// Propagates everything else (notably `SetSockOpt`, which happens
-    /// *after* `TCP_ULP` has attached and leaves the socket in an
-    /// unrecoverable state).
+    /// RX is installed first. Its rejection leaves both directions on
+    /// TCP; a subsequent TX failure leaves RX active and is fatal.
     ///
     /// On Linux the kernel `tls` module must be loaded
     /// (`sudo modprobe tls`, or add `tls` to `/etc/modules-load.d/`)
@@ -125,27 +260,13 @@ impl TlsStream {
     /// to branch on host support, or check [`Self::ktls_active`]
     /// post-handshake to see whether the install actually happened.
     ///
-    /// # Post-handshake records (TLS 1.3 `KeyUpdate`, alerts)
+    /// # Post-handshake records
     ///
-    /// Once kTLS is installed the kernel owns the record layer and
-    /// AWS-LC's `SSL` object is no longer driving the wire. AWS-LC
-    /// does **not** support rekeying after a kTLS attach: a peer-
-    /// initiated TLS 1.3 `KeyUpdate` cannot be honoured because the
-    /// new traffic secrets would have to be re-uploaded via
-    /// `setsockopt(SOL_TLS, TLS_TX|TLS_RX, ...)` and the engine has
-    /// no path to recompute them in-place. When the kernel receives
-    /// any non-`application_data` record after attach it returns
-    /// `EIO` on the next `read(2)`; that surfaces as an
-    /// `io::ErrorKind::Other` from this stream's `AsyncRead` impl and
-    /// the connection is effectively torn down. This is the strictest
-    /// of the available options: `HAProxy` peeks at
-    /// `TLS_GET_RECORD_TYPE` via `recvmsg` cmsg to swallow
-    /// `NewSessionTicket` records and translate `close_notify`
-    /// warnings into EOF, but Tokio's [`AsyncRead`] has no cmsg
-    /// surface to plumb that through. Callers who need long-lived
-    /// sessions across rekeys should disable kTLS on those
-    /// connections via [`crate::ServerConfigBuilder::disable_ktls`] /
-    /// [`crate::ClientConfigBuilder::disable_ktls`].
+    /// `recvmsg` distinguishes application data from authenticated
+    /// `close_notify` alerts. A bare TCP FIN is `UnexpectedEof`.
+    /// Handshake controls, including TLS 1.3 `NewSessionTicket` and
+    /// `KeyUpdate`, remain unsupported and produce a terminal error.
+    /// Disable kTLS when these are needed; libssl then processes them.
     ///
     /// Server-emitted post-handshake records cannot happen on this
     /// crate's server path: tickets are disabled by construction
@@ -179,7 +300,8 @@ impl TlsStream {
                 KtlsError::Unsupported
                 | KtlsError::IneligibleCipher { .. }
                 | KtlsError::TlsUlpUnavailable(_)
-                | KtlsError::SocketUnattachable(_),
+                | KtlsError::SocketUnattachable(_)
+                | KtlsError::CryptoUnavailable(_),
             )) => Ok(()),
             Err(e) => Err(e),
         }
@@ -224,8 +346,18 @@ impl AsyncRead for TlsStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = &mut *self;
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        #[cfg(target_os = "linux")]
         if this.ktls_active {
-            return ktls_poll_read(&this.tcp, cx, buf);
+            return this.ktls_reader.poll_read(&this.tcp, cx, buf);
+        }
+        // Flush accepted output when switching to reading (e.g. a
+        // request/response exchange), but do not block inbound progress
+        // on outbound backpressure: split peers may both be writing.
+        if let Poll::Ready(Err(error)) = this.poll_pending_write(cx, true) {
+            return Poll::Ready(Err(error));
         }
         loop {
             let unfilled = buf.initialize_unfilled();
@@ -249,16 +381,9 @@ impl AsyncRead for TlsStream {
             let err = unsafe { aws_lc_sys::SSL_get_error(this.ssl.as_ptr(), n) };
             match err {
                 aws_lc_sys::SSL_ERROR_ZERO_RETURN => return Poll::Ready(Ok(())),
-                aws_lc_sys::SSL_ERROR_WANT_READ => match poll_clear_read_ready(&this.tcp, cx) {
-                    Poll::Ready(Ok(())) => {}
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
-                },
-                aws_lc_sys::SSL_ERROR_WANT_WRITE => match poll_clear_write_ready(&this.tcp, cx) {
-                    Poll::Ready(Ok(())) => {}
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
-                },
+                aws_lc_sys::SSL_ERROR_WANT_READ | aws_lc_sys::SSL_ERROR_WANT_WRITE => {
+                    ready!(this.poll_ssl_ready(err, cx, true))?;
+                }
                 _ => return Poll::Ready(Err(ssl_io_error("SSL_read", err))),
             }
         }
@@ -275,61 +400,63 @@ impl AsyncWrite for TlsStream {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
+        if let Some(error) = &this.write_error {
+            return Poll::Ready(Err(duplicate_io_error(error)));
+        }
+        if this.shutdown != Shutdown::Open {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "TLS write half is shut down",
+            )));
+        }
         if this.ktls_active {
             return ktls_poll_write(&this.tcp, cx, buf);
         }
-        loop {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            let cap = buf.len().min(c_int::MAX as usize) as c_int;
-            // SAFETY: ssl is live; buf is a readable buffer of length cap.
-            let n = unsafe { aws_lc_sys::SSL_write(this.ssl.as_ptr(), buf.as_ptr().cast(), cap) };
-            if n > 0 {
-                #[allow(clippy::cast_sign_loss)]
-                return Poll::Ready(Ok(n as usize));
-            }
-            // SAFETY: ssl is live.
-            let err = unsafe { aws_lc_sys::SSL_get_error(this.ssl.as_ptr(), n) };
-            match err {
-                aws_lc_sys::SSL_ERROR_WANT_READ => match poll_clear_read_ready(&this.tcp, cx) {
-                    Poll::Ready(Ok(())) => {}
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
-                },
-                aws_lc_sys::SSL_ERROR_WANT_WRITE => match poll_clear_write_ready(&this.tcp, cx) {
-                    Poll::Ready(Ok(())) => {}
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
-                },
-                aws_lc_sys::SSL_ERROR_ZERO_RETURN => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "peer closed TLS session",
-                    )))
-                }
-                _ => return Poll::Ready(Err(ssl_io_error("SSL_write", err))),
-            }
+        ready!(this.poll_pending_write(cx, false))?;
+        let chunk = &buf[..buf.len().min(MAX_PLAINTEXT)];
+        let len = c_int::try_from(chunk.len()).expect("one TLS record");
+        // SAFETY: live SSL; chunk remains readable through this call.
+        let n = unsafe { aws_lc_sys::SSL_write(this.ssl.as_ptr(), chunk.as_ptr().cast(), len) };
+        if n > 0 {
+            return Poll::Ready(Ok(usize::try_from(n).expect("positive write")));
+        }
+        // SAFETY: immediately follows the failed SSL_write.
+        let code = unsafe { aws_lc_sys::SSL_get_error(this.ssl.as_ptr(), n) };
+        if matches!(
+            code,
+            aws_lc_sys::SSL_ERROR_WANT_READ | aws_lc_sys::SSL_ERROR_WANT_WRITE
+        ) {
+            // SSL has committed to this plaintext. Own it and ACK it
+            // now, never return Pending after accepting caller bytes.
+            this.pending_write.extend_from_slice(chunk);
+            Poll::Ready(Ok(chunk.len()))
+        } else {
+            let error = ssl_io_error("SSL_write", code);
+            Poll::Ready(Err(this.write_failure(error)))
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // SSL writes go straight through to the socket via SSL_set_bio;
-        // there is no userspace buffer to flush. Same after kTLS
-        // install: the kernel buffers like any other TCP socket.
-        Poll::Ready(Ok(()))
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_pending_write(cx, false)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = &mut *self;
+        ready!(this.poll_pending_write(cx, false))?;
+        if this.shutdown == Shutdown::Closed {
+            return Poll::Ready(Ok(()));
+        }
+        this.shutdown = Shutdown::Sending;
+        #[cfg(target_os = "linux")]
         if this.ktls_active {
-            // After kTLS install, libssl no longer knows about the
-            // socket state, so `SSL_shutdown` would write a TLS alert
-            // record that the kernel `tls` ULP would re-encrypt as
-            // application_data and corrupt the stream. The kernel
-            // `tls` ULP also does not emit close_notify on TCP FIN by
-            // itself, so we just shut the write half down — the peer's
-            // kTLS_RX surfaces a clean EOF. This is the standard kTLS
-            // shutdown pattern.
-            return Pin::new(&mut this.tcp).poll_shutdown(cx);
+            if let Err(error) = ready!(crate::ktls::io::poll_close_notify(&this.tcp, cx)) {
+                return Poll::Ready(Err(this.write_failure(error)));
+            }
+            // close_notify has been accepted exactly once. Tokio's TCP
+            // shutdown is a synchronous shutdown(SHUT_WR), not a flush.
+            this.shutdown = Shutdown::Closed;
+            let result = ready!(Pin::new(&mut this.tcp).poll_shutdown(cx));
+            return Poll::Ready(result.map_err(|error| this.write_failure(error)));
         }
         loop {
             // SAFETY: ssl is live.
@@ -337,61 +464,22 @@ impl AsyncWrite for TlsStream {
             if r >= 0 {
                 // 0 = our close_notify sent; 1 = peer's also seen.
                 // Either is "done" from our side.
+                this.shutdown = Shutdown::Closed;
                 return Poll::Ready(Ok(()));
             }
             // SAFETY: ssl is live.
             let err = unsafe { aws_lc_sys::SSL_get_error(this.ssl.as_ptr(), r) };
             match err {
-                aws_lc_sys::SSL_ERROR_WANT_READ => match poll_clear_read_ready(&this.tcp, cx) {
-                    Poll::Ready(Ok(())) => {}
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
-                },
-                aws_lc_sys::SSL_ERROR_WANT_WRITE => match poll_clear_write_ready(&this.tcp, cx) {
-                    Poll::Ready(Ok(())) => {}
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
-                },
-                // Peer already sent close_notify, or the transport
-                // returned EOF before our shutdown alert landed. Treat
-                // as a clean shutdown.
-                aws_lc_sys::SSL_ERROR_ZERO_RETURN | aws_lc_sys::SSL_ERROR_SYSCALL => {
-                    return Poll::Ready(Ok(()));
+                aws_lc_sys::SSL_ERROR_WANT_READ | aws_lc_sys::SSL_ERROR_WANT_WRITE => {
+                    if let Err(error) = ready!(this.poll_ssl_ready(err, cx, false)) {
+                        return Poll::Ready(Err(this.write_failure(error)));
+                    }
                 }
-                _ => return Poll::Ready(Err(ssl_io_error("SSL_shutdown", err))),
+                _ => {
+                    let error = ssl_io_error("SSL_shutdown", err);
+                    return Poll::Ready(Err(this.write_failure(error)));
+                }
             }
-        }
-    }
-}
-
-/// kTLS-mode `poll_read`: `read(2)` plaintext directly off the socket.
-/// The kernel handles the AEAD record layer transparently.
-fn ktls_poll_read(
-    tcp: &TcpStream,
-    cx: &mut Context<'_>,
-    buf: &mut ReadBuf<'_>,
-) -> Poll<io::Result<()>> {
-    loop {
-        let unfilled = buf.initialize_unfilled();
-        if unfilled.is_empty() {
-            return Poll::Ready(Ok(()));
-        }
-        // `try_read` clears the cached readable bit on WouldBlock so the
-        // subsequent `poll_read_ready` waits for a fresh OS notification
-        // instead of busy-looping.
-        match tcp.try_read(unfilled) {
-            Ok(0) => return Poll::Ready(Ok(())), // EOF
-            Ok(n) => {
-                buf.advance(n);
-                return Poll::Ready(Ok(()));
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => match tcp.poll_read_ready(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            },
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Poll::Ready(Err(e)),
         }
     }
 }
@@ -444,8 +532,25 @@ fn poll_clear_write_ready(tcp: &TcpStream, cx: &mut Context<'_>) -> Poll<io::Res
 /// Build an `io::Error` from the last AWS-LC failure on the current
 /// thread, prefixed with which call surfaced it.
 fn ssl_io_error(op: &'static str, code: c_int) -> io::Error {
+    let os_error = io::Error::last_os_error();
     let detail = last_error();
+    if code == aws_lc_sys::SSL_ERROR_SYSCALL {
+        if os_error.raw_os_error().is_some_and(|errno| errno != 0) {
+            return os_error;
+        }
+        return io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "TLS peer closed without close_notify",
+        );
+    }
     io::Error::other(format!("{op}: ssl_error={code} {detail}"))
+}
+
+fn duplicate_io_error(error: &io::Error) -> io::Error {
+    error.raw_os_error().map_or_else(
+        || io::Error::new(error.kind(), error.to_string()),
+        io::Error::from_raw_os_error,
+    )
 }
 
 /// Attach a BIO that does *not* close the fd on free; the

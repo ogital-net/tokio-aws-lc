@@ -14,13 +14,13 @@ for most workloads. `tokio-aws-lc` exists for two cases it doesn't
 cover:
 
 - **kTLS without manual plumbing.** The kernel's `tls` ULP turns
-  per-record AEAD into a `read(2)` / `write(2)`, dropping a userspace
+  per-record AEAD into `recvmsg(2)` / `write(2)`, dropping a userspace
   copy and the AEAD CPU on bulk transfers. Wiring it against rustls
   means reaching past the public API to extract the negotiated
   traffic keys and calling `setsockopt(SOL_TLS, ...)` by hand. This
   crate installs both directions on `accept` / `connect` completion
-  whenever the negotiated cipher is one the kernel understands, and
-  the data path flips to `read(2)` / `write(2)` automatically.
+  when the session and kernel support it, and the data path flips to
+  `recvmsg(2)` / `write(2)` automatically.
 - **A single AWS-LC.** A codebase that already links `aws-lc-sys`
   (FIPS deployments, hand-rolled EC code, shared X.509 handling)
   otherwise pulls two near-identical libcryptos once it also depends
@@ -70,9 +70,9 @@ Pre-release (`0.2.0`).
 | Linux kTLS (`TLS_TX` + `TLS_RX`) | TLS 1.3 (AES-128/256-GCM, ChaCha20-Poly1305) and TLS 1.2 AEAD; integration-tested via `/proc/net/tls_stat`. |
 | Optional `hyper` integration | Server acceptor + `tower::Service<Uri>` client connector for `hyper` 1.x. |
 
-Not in `0.1`: session resumption, `UnixStream`, BIO-pair fallback for
-arbitrary IO, post-attach TLS 1.3 `KeyUpdate`, `tracing` instrumentation,
-Windows.
+Not in `0.2`: session resumption, `UnixStream`, BIO-pair fallback for
+arbitrary IO, post-attach handshake controls (including TLS 1.3
+`NewSessionTicket` and `KeyUpdate`), `tracing` instrumentation, Windows.
 
 ## Install
 
@@ -81,8 +81,8 @@ Windows.
 tokio-aws-lc = "0.2"
 ```
 
-The default build pulls only `aws-lc-sys` and `tokio`. The `hyper`
-adapters are opt-in:
+The default build's direct runtime dependencies are `aws-lc-sys`,
+`tokio`, and, on Linux only, `libc`. The `hyper` adapters are opt-in:
 
 ```toml
 tokio-aws-lc = { version = "0.2", features = ["hyper"] }
@@ -144,6 +144,7 @@ let tcp = TcpStream::connect(("example.com", 443)).await?;
 let mut tls = connector.connect("example.com", tcp).await?;
 tls.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
     .await?;
+tls.flush().await?;
 let mut body = Vec::new();
 tls.read_to_end(&mut body).await?;
 # Ok(())
@@ -155,25 +156,44 @@ names go out as the SNI extension and are matched against the
 certificate's DNS SANs / CN; IP literals skip SNI (RFC 6066 §3) and
 are matched against the certificate's iPAddress SANs.
 
+### Userspace writes
+
+Each userspace `poll_write` accepts at most one 16 KiB plaintext chunk.
+The fast path passes the caller's slice directly to AWS-LC without an
+adapter copy. If AWS-LC needs to retry, the slow path owns at most
+16 KiB of plaintext and acknowledges it with `Ready(Ok(n))`, not
+`Pending`. Accepted bytes may still be buffered: call `flush()` or
+`shutdown()` to ensure they are sent; `write_all()` alone does not flush.
+
+### Configuration guarantees
+
+A nonempty `cipher_suites` list is an allowlist enforced for both TLS
+1.2 and TLS 1.3; a version with no listed suites is disabled. An empty
+list resets the override to defaults (including `ktls_aead_only` on
+the server, if set). Each DER certificate slice and private-key slice
+must contain exactly one object; trailing bytes or concatenated objects
+are rejected.
+
 ## Linux kTLS
 
 When the negotiated session is kTLS-eligible (TLS 1.2 or 1.3 with
 AES-GCM or ChaCha20-Poly1305), the kernel `tls` ULP is attached to
 the TCP socket and the negotiated AEAD keys are uploaded for both
 directions. After that, `AsyncRead` / `AsyncWrite` move plaintext
-through `read(2)` / `write(2)` and the kernel runs the AEAD record
-layer.
+through `recvmsg(2)` / `write(2)` and the kernel runs the AEAD record
+layer. Reads inspect the `TLS_GET_RECORD_TYPE` cmsg and place application
+data directly in the caller's buffer, without a staging copy.
 
-Install happens automatically when `TlsAcceptor::accept` /
-`TlsConnector::connect` resolves. Hosts that can't take the install
-— non-Linux, kernels without `CONFIG_TLS`, the module not loaded,
-sessions with an ineligible cipher — stay on the userspace AEAD path
-without surfacing an error. Inspect `TlsStream::ktls_active()` after
-the handshake to confirm.
+Install is enabled by default on `TlsAcceptor::accept` /
+`TlsConnector::connect`. Unsupported hosts or sessions stay on the
+userspace AEAD path without surfacing an error. RX is installed first:
+rejection before either direction is active permits safe userspace
+fallback. **Exception:** if TX installation fails after RX succeeds,
+the connection fails and the socket is closed; there is no safe rollback
+or userspace fallback from a partially active install. Inspect
+`TlsStream::ktls_active()` after the handshake to confirm offload.
 
-The probe is cheap (`SSL_pending` + one or three `setsockopt` calls,
-on the order of a microsecond on loopback) so it's safe to leave on.
-To skip it entirely, call `disable_ktls()` on the builder:
+To skip the install attempt entirely, call `disable_ktls()` on the builder:
 
 ```rust,no_run
 use tokio_aws_lc::ServerConfig;
@@ -187,8 +207,8 @@ let cfg = ServerConfig::builder()
 ```
 
 That's worth doing when you statically know the environment can't use
-kTLS (locked-down containers without the module) or when you need
-long-lived sessions where TLS 1.3 `KeyUpdate` may eventually fire.
+kTLS (locked-down containers without the module). Disable kTLS whenever
+you require post-handshake support, including tickets or key updates.
 
 `tokio_aws_lc::host_ktls_available()` is a startup probe that checks
 for `/proc/net/tls_stat`, so consumers can branch on host support
@@ -202,26 +222,24 @@ Host prerequisites:
   `/etc/modules-load.d/`). Inside containers, the host kernel must
   provide it.
 
-### Re-key behavior
+### Control records and shutdown
 
-No userspace TLS stack handles a TLS 1.3 `KeyUpdate` after a kTLS
-attach transparently: once the kernel owns the receive path, the
-userspace engine never sees the post-handshake record, so it can't
-rotate the kernel's keys. This crate currently lets the kernel
-return `EIO` on any non-`application_data` record reaching the
-socket, which surfaces as an IO error and tears the session down.
-That is the strictest of the available options — `HAProxy` peeks at
-`TLS_GET_RECORD_TYPE` via `recvmsg` cmsg to swallow
-`NewSessionTicket` records and translate `close_notify` alerts into
-EOF, but Tokio's `AsyncRead` has no cmsg surface to plumb that
-through.
+kTLS shutdown sends a proper TLS `close_notify` alert using `sendmsg(2)`
+with a record-type cmsg before closing the TCP write half. A received
+`close_notify` produces graceful EOF; a bare TCP FIN without it is
+`io::ErrorKind::UnexpectedEof`.
 
-Callers that need long-lived sessions across rekeys should
-`disable_ktls()` on those connections. Server-emitted post-handshake
-records do not happen on this crate's server path: tickets are
-disabled by construction (`SSL_OP_NO_TICKET` +
-`SSL_CTX_set_num_tickets(0)`), and the crate never initiates a
-`KeyUpdate` itself.
+All post-attach handshake controls, including TLS 1.3 `NewSessionTicket`
+and `KeyUpdate`, remain unsupported and cause an explicit, terminal
+`io::ErrorKind::Unsupported` read error. Tickets are not silently discarded,
+and keys are not updated. This is a limitation of this crate's current
+implementation, not of Tokio's abstraction; control records are handled
+via `recvmsg` rather than a blanket `EIO` path.
+
+Use `disable_ktls()` when post-handshake support is required. This crate's
+server always disables tickets (`SSL_OP_NO_TICKET` +
+`SSL_CTX_set_num_tickets(0)`), even with kTLS disabled, and never initiates
+a `KeyUpdate` itself.
 
 ## Examples
 

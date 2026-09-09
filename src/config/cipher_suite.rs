@@ -9,6 +9,10 @@
 //! to that set; callers don't have to spell out OpenSSL cipher-list
 //! grammar by hand.
 //!
+//! A non-empty set disables any TLS version for which it contains no
+//! suites, without changing the configured minimum or maximum version.
+//! An empty set leaves AWS-LC's defaults in place.
+//!
 //! Only AEAD suites (AES-GCM, ChaCha20-Poly1305) are exposed, matching
 //! the rustls aws-lc-rs provider's modern-only stance. CBC-SHA, RC4,
 //! and other legacy suites are deliberately not provided. The same
@@ -211,10 +215,29 @@ pub(crate) fn split_for_aws_lc(suites: &[&CipherSuite]) -> (Option<String>, Opti
 }
 
 /// Apply a slice of cipher suites to an `SSL_CTX` by calling the
-/// appropriate AWS-LC setter for each version. A no-op on an empty
-/// slice.
+/// appropriate AWS-LC setter for each version. Versions omitted from a
+/// non-empty slice are disabled; configured version bounds stay intact.
+/// A no-op on an empty slice.
 pub(crate) fn apply_to_ctx(ctx: &SslCtx, suites: &[&CipherSuite]) -> Result<()> {
+    if suites.is_empty() {
+        return Ok(());
+    }
     let (tls12, tls13) = split_for_aws_lc(suites);
+    let mut disabled_versions = 0;
+    if tls12.is_none() {
+        disabled_versions |= aws_lc_sys::SSL_OP_NO_TLSv1_2;
+    }
+    if tls13.is_none() {
+        disabled_versions |= aws_lc_sys::SSL_OP_NO_TLSv1_3;
+    }
+    // Use protocol options rather than rewriting min/max bounds: AWS-LC
+    // intersects these flags with the configured range and rejects the
+    // handshake if no version remains. Existing options are preserved.
+    let disabled_versions =
+        u32::try_from(disabled_versions).expect("AWS-LC protocol option bits fit in u32");
+    // SAFETY: ctx is live; the mask contains only SSL_OP_* constants.
+    unsafe { aws_lc_sys::SSL_CTX_set_options(ctx.as_ptr(), disabled_versions) };
+
     if let Some(list) = tls12 {
         let c = CString::new(list).expect("cipher-suite names contain no NUL bytes");
         // SAFETY: ctx is live; the CString is valid for the call.
@@ -292,6 +315,68 @@ mod tests {
         let (tls12, tls13) = split_for_aws_lc(&[TLS13_AES_256_GCM_SHA384]);
         assert!(tls12.is_none());
         assert_eq!(tls13.as_deref(), Some("TLS_AES_256_GCM_SHA384"));
+    }
+
+    #[test]
+    fn apply_preserves_bounds_and_existing_options() {
+        let cases: &[(&[&CipherSuite], i32)] = &[
+            (&[], 0),
+            (
+                &[TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256],
+                aws_lc_sys::SSL_OP_NO_TLSv1_3,
+            ),
+            (&[TLS13_AES_128_GCM_SHA256], aws_lc_sys::SSL_OP_NO_TLSv1_2),
+            (
+                &[
+                    TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                    TLS13_AES_128_GCM_SHA256,
+                ],
+                0,
+            ),
+        ];
+        for &(suites, disabled) in cases {
+            for min in [ProtocolVersion::Tls12, ProtocolVersion::Tls13] {
+                for max in [ProtocolVersion::Tls12, ProtocolVersion::Tls13] {
+                    // SAFETY: TLS_method is static; SSL_CTX_new returns an
+                    // owned context or null, transferred to the RAII guard.
+                    let ctx = unsafe {
+                        SslCtx::from_raw(aws_lc_sys::SSL_CTX_new(aws_lc_sys::TLS_method()))
+                    }
+                    .expect("SSL_CTX_new");
+                    // SAFETY: ctx is live; bounds and options are constants.
+                    let options = unsafe {
+                        assert_eq!(
+                            aws_lc_sys::SSL_CTX_set_min_proto_version(ctx.as_ptr(), min.raw()),
+                            1
+                        );
+                        assert_eq!(
+                            aws_lc_sys::SSL_CTX_set_max_proto_version(ctx.as_ptr(), max.raw()),
+                            1
+                        );
+                        aws_lc_sys::SSL_CTX_set_options(
+                            ctx.as_ptr(),
+                            u32::try_from(aws_lc_sys::SSL_OP_NO_TICKET).unwrap(),
+                        )
+                    };
+                    apply_to_ctx(&ctx, suites).expect("apply cipher allowlist");
+                    // SAFETY: all getters borrow the live context.
+                    unsafe {
+                        assert_eq!(
+                            aws_lc_sys::SSL_CTX_get_min_proto_version(ctx.as_ptr()),
+                            min.raw()
+                        );
+                        assert_eq!(
+                            aws_lc_sys::SSL_CTX_get_max_proto_version(ctx.as_ptr()),
+                            max.raw()
+                        );
+                        assert_eq!(
+                            aws_lc_sys::SSL_CTX_get_options(ctx.as_ptr()),
+                            options | u32::try_from(disabled).unwrap()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -73,8 +73,23 @@ pub enum KtlsError {
     /// and keeps the stream on userspace AEAD so callers don't lose
     /// connections to benign races.
     SocketUnattachable(io::Error),
-    /// `setsockopt(SOL_TLS, TLS_TX / TLS_RX, ...)` failed with the
-    /// wrapped errno (e.g. kernel too old for the selected cipher).
+    /// The `tls` ULP attached, but the initial `TLS_RX` crypto
+    /// configuration was rejected (e.g. the kernel does not support
+    /// the negotiated cipher or TLS version). Neither RX nor TX is
+    /// active: the ULP still forwards raw TCP bytes in both directions,
+    /// so it is safe to keep using libssl for userspace AEAD.
+    ///
+    /// Unlike [`Self::SetSockOpt`], this is a safe fallback condition,
+    /// not an unrecoverable partial installation.
+    CryptoUnavailable(io::Error),
+    /// Unrecoverable `setsockopt` failure. In particular, a `TLS_TX`
+    /// failure after `TLS_RX` succeeded leaves receive offload active;
+    /// it cannot be transparently rolled back to userspace AEAD.
+    /// The caller must close the connection, not fall back to libssl.
+    /// Also used for unexpected errors while attaching the `tls` ULP.
+    ///
+    /// Initial RX rejection, before either direction is active, is
+    /// reported as [`Self::CryptoUnavailable`] instead.
     SetSockOpt(io::Error),
 }
 
@@ -114,7 +129,16 @@ impl fmt::Display for KtlsError {
                 "kernel rejected TCP_ULP attach on this socket ({e}); \
                  typically a transient race with TCP teardown"
             ),
-            Self::SetSockOpt(e) => write!(f, "setsockopt failed: {e}"),
+            Self::CryptoUnavailable(e) => write!(
+                f,
+                "kernel rejected kTLS RX crypto configuration ({e}); \
+                 neither direction is active, so userspace AEAD fallback is safe"
+            ),
+            Self::SetSockOpt(e) => write!(
+                f,
+                "setsockopt failed: {e}; kTLS installation is unrecoverable \
+                 (possibly partially active); close the connection"
+            ),
         }
     }
 }
@@ -132,9 +156,10 @@ impl std::error::Error for Error {
 impl std::error::Error for KtlsError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::SetSockOpt(e) | Self::TlsUlpUnavailable(e) | Self::SocketUnattachable(e) => {
-                Some(e)
-            }
+            Self::SetSockOpt(e)
+            | Self::TlsUlpUnavailable(e)
+            | Self::SocketUnattachable(e)
+            | Self::CryptoUnavailable(e) => Some(e),
             Self::Unsupported | Self::IneligibleCipher { .. } | Self::BufferedPlaintext(_) => None,
         }
     }
@@ -321,10 +346,30 @@ mod tests {
         let ke = KtlsError::SetSockOpt(inner);
         let s = format!("{ke}");
         assert!(s.starts_with("setsockopt failed:"), "got: {s}");
+        assert!(s.contains("unrecoverable"), "got: {s}");
+        assert!(s.contains("close the connection"), "got: {s}");
         assert!(std::error::Error::source(&ke).is_some());
         // Wrap and exercise Error::source for the Ktls arm too.
         let e = Error::Ktls(KtlsError::SetSockOpt(io::Error::from_raw_os_error(13)));
         assert!(std::error::Error::source(&e).is_some());
+    }
+
+    #[test]
+    fn ktls_crypto_unavailable_display_and_source() {
+        let ke = KtlsError::CryptoUnavailable(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsupported crypto",
+        ));
+        let s = format!("{ke}");
+        assert!(s.contains("unsupported crypto"), "got: {s}");
+        assert!(s.contains("neither direction is active"), "got: {s}");
+        assert!(s.contains("fallback is safe"), "got: {s}");
+        let source = std::error::Error::source(&ke)
+            .unwrap()
+            .downcast_ref::<io::Error>()
+            .unwrap();
+        assert_eq!(source.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(source.to_string(), "unsupported crypto");
     }
 
     #[test]

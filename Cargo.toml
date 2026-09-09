@@ -60,6 +60,10 @@ hyper-util = { version = "0.1", default-features = false, features = [
 ], optional = true }
 tower-service = { version = "0.3", optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Native msghdr/cmsg layouts and socket constants vary across Linux ABIs.
+libc = "0.2"
+
 [dev-dependencies]
 # Test/bench/example harness: `macros` for #[tokio::test] and
 # #[tokio::main]; `rt-multi-thread` for the bench runtime + example

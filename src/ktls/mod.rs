@@ -12,6 +12,8 @@ pub(crate) mod cipher;
 pub(crate) mod crypto_info;
 #[cfg(target_os = "linux")]
 pub(crate) mod derive;
+#[cfg(target_os = "linux")]
+pub(crate) mod io;
 
 use std::os::raw::c_int;
 
@@ -97,6 +99,12 @@ enum CryptoInfo {
 
 /// Derive TX/RX crypto-info blocks from a finished SSL handshake, then
 /// push them into the kernel `tls` ULP on `fd`.
+///
+/// RX is installed first. If it is rejected, [`KtlsError::CryptoUnavailable`]
+/// leaves both directions forwarding TCP bytes, so userspace AEAD is safe.
+/// Once RX succeeds, a TX failure is fatal ([`KtlsError::SetSockOpt`]); the
+/// socket owner must close the connection rather than resume libssl I/O.
+/// This function borrows `fd` and does not close it itself.
 ///
 /// On non-Linux targets returns [`KtlsError::Unsupported`] and does not
 /// touch the socket.
@@ -323,53 +331,43 @@ mod linux {
     //! `unsafe` syscall surface for kTLS lives in one place.
 
     use std::io;
-    use std::os::raw::{c_int, c_void};
+    use std::os::raw::c_int;
+
+    use libc::{setsockopt, socklen_t, EBUSY, EISCONN, ENOENT, ENOPROTOOPT, ENOTCONN};
 
     use super::crypto_info::{SOL_TCP, SOL_TLS, TCP_ULP, TLS_RX, TLS_TX};
     use super::CryptoInfo;
     use crate::error::KtlsError;
 
-    // We deliberately do not pull `libc`. `setsockopt` is a stable Linux
-    // syscall with a fixed signature; binding it directly costs four
-    // lines and keeps the runtime dep surface to `aws-lc-sys` + `tokio`.
-    #[allow(non_camel_case_types)]
-    type socklen_t = u32;
-
-    // Stable Linux errno values; hard-coded for the same reason we
-    // hand-bind `setsockopt`.
-    const ENOENT: i32 = 2;
-    const ENOPROTOOPT: i32 = 92;
-    const ENOTCONN: i32 = 107;
-    const EISCONN: i32 = 106;
-    const EBUSY: i32 = 16;
-
-    extern "C" {
-        fn setsockopt(
-            sockfd: c_int,
-            level: c_int,
-            optname: c_int,
-            optval: *const c_void,
-            optlen: socklen_t,
-        ) -> c_int;
-    }
-
     pub(super) fn install(fd: c_int, info: &CryptoInfo) -> Result<(), KtlsError> {
         set_ulp_tls(fd).map_err(classify_ulp_error)?;
-        match info {
+        install_rx_then_tx(|direction| match info {
             CryptoInfo::AesGcm128 { tx, rx } => {
-                set_crypto_info(fd, TLS_TX, tx).map_err(KtlsError::SetSockOpt)?;
-                set_crypto_info(fd, TLS_RX, rx).map_err(KtlsError::SetSockOpt)?;
+                set_crypto_info(fd, direction, if direction == TLS_RX { rx } else { tx })
             }
             CryptoInfo::AesGcm256 { tx, rx } => {
-                set_crypto_info(fd, TLS_TX, tx).map_err(KtlsError::SetSockOpt)?;
-                set_crypto_info(fd, TLS_RX, rx).map_err(KtlsError::SetSockOpt)?;
+                set_crypto_info(fd, direction, if direction == TLS_RX { rx } else { tx })
             }
             CryptoInfo::Chacha20Poly1305 { tx, rx } => {
-                set_crypto_info(fd, TLS_TX, tx).map_err(KtlsError::SetSockOpt)?;
-                set_crypto_info(fd, TLS_RX, rx).map_err(KtlsError::SetSockOpt)?;
+                set_crypto_info(fd, direction, if direction == TLS_RX { rx } else { tx })
             }
-        }
-        Ok(())
+        })
+    }
+
+    /// Only called after a fresh ULP attach, with neither direction active.
+    /// Kept injectable so failure handling can be tested without kernel TLS.
+    fn install_rx_then_tx(
+        mut set_direction: impl FnMut(c_int) -> io::Result<()>,
+    ) -> Result<(), KtlsError> {
+        // Linux tls_init leaves RX/TX in TLS_BASE, forwarding TCP I/O.
+        // do_tls_setsockopt_conf only commits *_conf/update_sk_prot after
+        // success; err_crypto_info clears the rejected crypto context.
+        // Thus an initial RX rejection leaves the ULP inert. RX support
+        // can lag TX support, so trying RX first preserves safe fallback.
+        set_direction(TLS_RX).map_err(KtlsError::CryptoUnavailable)?;
+        // RX is now active and cannot be transparently undone. Keep a TX
+        // failure fatal so the socket owner closes this partial install.
+        set_direction(TLS_TX).map_err(KtlsError::SetSockOpt)
     }
 
     /// `ENOENT` is what the kernel returns from `__tcp_ulp_find_autoload`
@@ -442,6 +440,107 @@ mod linux {
         use super::*;
 
         #[test]
+        fn crypto_install_is_rx_then_tx() {
+            let mut directions = Vec::new();
+            install_rx_then_tx(|direction| {
+                directions.push(direction);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(directions, [TLS_RX, TLS_TX]);
+        }
+
+        #[test]
+        fn rx_rejection_is_safe_and_never_attempts_tx() {
+            for errno in [libc::EINVAL, libc::EOPNOTSUPP, ENOPROTOOPT, libc::ENOMEM] {
+                let mut directions = Vec::new();
+                let result = install_rx_then_tx(|direction| {
+                    directions.push(direction);
+                    assert_eq!(direction, TLS_RX, "TX must not run after RX rejection");
+                    Err(io::Error::from_raw_os_error(errno))
+                });
+                assert_eq!(directions, [TLS_RX]);
+                assert!(matches!(
+                    result,
+                    Err(KtlsError::CryptoUnavailable(e)) if e.raw_os_error() == Some(errno)
+                ));
+            }
+        }
+
+        #[test]
+        fn tx_rejection_after_rx_success_is_fatal() {
+            let mut directions = Vec::new();
+            let result = install_rx_then_tx(|direction| {
+                directions.push(direction);
+                if direction == TLS_TX {
+                    Err(io::Error::from_raw_os_error(libc::EINVAL))
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(directions, [TLS_RX, TLS_TX]);
+            assert!(matches!(
+                result,
+                Err(KtlsError::SetSockOpt(e)) if e.raw_os_error() == Some(libc::EINVAL)
+            ));
+        }
+
+        #[tokio::test]
+        async fn rejected_rx_leaves_ulp_forwarding_raw_tcp() {
+            use std::os::fd::AsRawFd;
+            use std::time::Duration;
+
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::net::{TcpListener, TcpStream};
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let (mut peer, (mut stream, _)) =
+                    tokio::try_join!(TcpStream::connect(addr), listener.accept()).unwrap();
+
+                let tx = super::super::build_aes_gcm_128(
+                    super::super::TLS_1_2_VERSION,
+                    &[0; 16],
+                    &[0; 4],
+                    &[0; 8],
+                    0,
+                );
+                let mut rx = tx;
+                // Invalid TLS version: rejected before any RX offload is
+                // enabled, even on a kernel without this cipher's AEAD.
+                rx.info.version = 0;
+                let info = CryptoInfo::AesGcm128 { tx, rx };
+                match install(stream.as_raw_fd(), &info) {
+                    Err(KtlsError::CryptoUnavailable(e)) => {
+                        assert_eq!(e.raw_os_error(), Some(libc::EINVAL));
+                    }
+                    Err(KtlsError::TlsUlpUnavailable(e)) => {
+                        eprintln!("skipping inert ULP check: tls ULP unavailable ({e})");
+                        return;
+                    }
+                    other => panic!("expected initial RX rejection, got {other:?}"),
+                }
+
+                // No handshake or TLS records: both directions must still
+                // pass bytes unchanged, as required for userspace AEAD.
+                let outbound = b"raw bytes from inert ULP";
+                stream.write_all(outbound).await.unwrap();
+                let mut received = vec![0; outbound.len()];
+                peer.read_exact(&mut received).await.unwrap();
+                assert_eq!(received.as_slice(), outbound);
+
+                let inbound = b"raw bytes to inert ULP";
+                peer.write_all(inbound).await.unwrap();
+                let mut received = vec![0; inbound.len()];
+                stream.read_exact(&mut received).await.unwrap();
+                assert_eq!(received.as_slice(), inbound);
+            })
+            .await
+            .expect("raw TCP forwarding after RX rejection timed out");
+        }
+
+        #[test]
         fn classify_enoent_is_ulp_unavailable() {
             let e = io::Error::from_raw_os_error(ENOENT);
             assert!(matches!(
@@ -478,8 +577,17 @@ mod linux {
         }
 
         #[test]
+        fn classify_ebusy_is_socket_unattachable() {
+            let e = io::Error::from_raw_os_error(EBUSY);
+            assert!(matches!(
+                classify_ulp_error(e),
+                KtlsError::SocketUnattachable(_)
+            ));
+        }
+
+        #[test]
         fn classify_other_errno_stays_generic() {
-            let e = io::Error::from_raw_os_error(13); // EACCES
+            let e = io::Error::from_raw_os_error(libc::EACCES);
             assert!(matches!(classify_ulp_error(e), KtlsError::SetSockOpt(_)));
         }
     }

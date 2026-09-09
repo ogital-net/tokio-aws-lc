@@ -13,6 +13,7 @@ use crate::error::{last_error, Error, Result};
 
 /// DER-decode a single X.509 certificate. Returns a freshly-owned
 /// `*mut X509`; the caller must `X509_free` it (or transfer ownership).
+/// The input must contain exactly one object with no trailing bytes.
 pub(super) fn parse_x509(der: &[u8]) -> Result<*mut aws_lc_sys::X509> {
     if der.is_empty() {
         return Err(Error::Init(
@@ -31,6 +32,13 @@ pub(super) fn parse_x509(der: &[u8]) -> Result<*mut aws_lc_sys::X509> {
     if cert.is_null() {
         return Err(Error::Init(format!("d2i_X509: {}", last_error())));
     }
+    if p != der.as_ptr_range().end {
+        // SAFETY: cert is freshly owned here and has not escaped.
+        unsafe { aws_lc_sys::X509_free(cert) };
+        return Err(Error::Init(
+            "DER-encoded certificate contains trailing data".into(),
+        ));
+    }
     Ok(cert)
 }
 
@@ -38,6 +46,7 @@ pub(super) fn parse_x509(der: &[u8]) -> Result<*mut aws_lc_sys::X509> {
 /// auto-detector accepts (PKCS#8, PKCS#1 RSA, SEC1 EC). Returns a
 /// freshly-owned `*mut EVP_PKEY`; the caller must `EVP_PKEY_free` it
 /// (or transfer ownership).
+/// The input must contain exactly one object with no trailing bytes.
 pub(super) fn parse_private_key(der: &[u8]) -> Result<*mut aws_lc_sys::EVP_PKEY> {
     if der.is_empty() {
         return Err(Error::Init(
@@ -55,5 +64,80 @@ pub(super) fn parse_private_key(der: &[u8]) -> Result<*mut aws_lc_sys::EVP_PKEY>
     if key.is_null() {
         return Err(Error::Init(format!("d2i_AutoPrivateKey: {}", last_error())));
     }
+    if p != der.as_ptr_range().end {
+        // SAFETY: key is freshly owned here and has not escaped.
+        unsafe { aws_lc_sys::EVP_PKEY_free(key) };
+        return Err(Error::Init(
+            "DER-encoded private key contains trailing data".into(),
+        ));
+    }
     Ok(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CERT_DER: &[u8] = include_bytes!("../../tests/data/cert.der");
+    const KEY_DER: &[u8] = include_bytes!("../../tests/data/key.der");
+
+    #[test]
+    fn valid_certificate_is_accepted() {
+        let cert = parse_x509(CERT_DER).expect("valid certificate");
+        // SAFETY: parse_x509 returned a freshly owned certificate.
+        unsafe { aws_lc_sys::X509_free(cert) };
+    }
+
+    #[test]
+    fn valid_private_key_is_accepted() {
+        let key = parse_private_key(KEY_DER).expect("valid private key");
+        // SAFETY: parse_private_key returned a freshly owned key.
+        unsafe { aws_lc_sys::EVP_PKEY_free(key) };
+    }
+
+    #[test]
+    fn certificate_trailing_garbage_is_rejected() {
+        for suffix in [b"\0".as_slice(), b"garbage".as_slice()] {
+            let der = [CERT_DER, suffix].concat();
+            assert!(matches!(
+                parse_x509(&der),
+                Err(Error::Init(message)) if message.contains("trailing data")
+            ));
+        }
+    }
+
+    #[test]
+    fn private_key_trailing_garbage_is_rejected() {
+        for suffix in [b"\0".as_slice(), b"garbage".as_slice()] {
+            let der = [KEY_DER, suffix].concat();
+            assert!(matches!(
+                parse_private_key(&der),
+                Err(Error::Init(message)) if message.contains("trailing data")
+            ));
+        }
+    }
+
+    #[test]
+    fn concatenated_certificates_are_rejected() {
+        assert!(matches!(
+            parse_x509(&[CERT_DER, CERT_DER].concat()),
+            Err(Error::Init(message)) if message.contains("trailing data")
+        ));
+    }
+
+    #[test]
+    fn concatenated_private_keys_are_rejected() {
+        assert!(matches!(
+            parse_private_key(&[KEY_DER, KEY_DER].concat()),
+            Err(Error::Init(message)) if message.contains("trailing data")
+        ));
+    }
+
+    #[test]
+    fn empty_and_truncated_objects_are_rejected() {
+        assert!(parse_x509(&[]).is_err());
+        assert!(parse_private_key(&[]).is_err());
+        assert!(parse_x509(&CERT_DER[..CERT_DER.len() - 1]).is_err());
+        assert!(parse_private_key(&KEY_DER[..KEY_DER.len() - 1]).is_err());
+    }
 }

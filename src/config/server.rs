@@ -1,10 +1,9 @@
 //! Server-side TLS configuration.
 //!
 //! [`ServerConfig`] wraps an `SSL_CTX` configured for the accept side.
-//! Tickets are unconditionally disabled on the server because a
-//! kernel-installed `TLS_TX` cannot encrypt the post-handshake
-//! `NewSessionTicket` records AWS-LC would emit. Building a
-//! ticket-emitting server config is therefore not exposed.
+//! Tickets are unconditionally disabled, even when kTLS is disabled:
+//! this crate does not support post-handshake `NewSessionTicket` emission
+//! after kTLS installation. A ticket-emitting config is not exposed.
 
 use std::ffi::CString;
 use std::os::raw::{c_int, c_long, c_uint, c_void};
@@ -55,7 +54,7 @@ impl ServerConfig {
 }
 
 /// Builder for [`ServerConfig`]. All setters are chainable; call one of
-/// the `with_pem_*` methods last to consume the builder.
+/// the `with_pem_*` methods or [`Self::with_der_bytes`] last to consume it.
 #[derive(Debug, Default)]
 pub struct ServerConfigBuilder {
     alpn_protocols: Vec<Vec<u8>>,
@@ -110,8 +109,8 @@ impl ServerConfigBuilder {
 
     /// Restrict TLS 1.2 ciphers to AEAD suites kTLS can offload. TLS 1.3
     /// is already AEAD-only. Recommended for servers where kTLS is the
-    /// primary data path; off by default since install is opt-in per
-    /// session.
+    /// primary data path. This restriction is off by default; kTLS
+    /// installation is still attempted by default for eligible sessions.
     #[must_use]
     pub fn ktls_aead_only(mut self, on: bool) -> Self {
         self.ktls_aead_only = on;
@@ -121,14 +120,17 @@ impl ServerConfigBuilder {
     /// Disable kTLS for streams produced by this config.
     ///
     /// By default, [`crate::TlsAcceptor::accept`] attempts to install
-    /// the Linux kernel `tls` ULP automatically once the handshake
-    /// finishes, falling back silently to userspace AEAD when the host
-    /// kernel does not support it. Calling this disables that attempt
-    /// outright: useful when you know the runtime environment has no
-    /// `tls` ULP (containers without the module, non-Linux hosts,
-    /// kernels older than 4.13) and want to skip even the probe.
-    /// Streams from this config stay on the userspace AEAD path; check
-    /// [`crate::TlsStream::ktls_disabled`] to confirm.
+    /// Linux kTLS after the handshake. Unsupported hosts or sessions and
+    /// rejection before either direction is active fall back silently to
+    /// userspace AEAD. RX is installed first; a TX failure after RX succeeds
+    /// is fatal and closes the socket, with no rollback or fallback.
+    ///
+    /// Calling this skips the attempt and keeps streams in userspace; check
+    /// [`crate::TlsStream::ktls_disabled`] to confirm. Use it when
+    /// post-handshake support is required: with kTLS active, all handshake
+    /// controls (including `NewSessionTicket` and `KeyUpdate`) cause a
+    /// terminal `io::ErrorKind::Unsupported` read error. Server tickets
+    /// remain disabled regardless of this setting.
     #[must_use]
     pub fn disable_ktls(mut self) -> Self {
         self.ktls_disabled = true;
@@ -137,8 +139,9 @@ impl ServerConfigBuilder {
 
     /// Restrict the supported cipher suites to the given set, using the
     /// typed constants in [`crate::cipher_suite`]. TLS 1.2 and TLS 1.3
-    /// suites are accepted in the same slice; the builder routes each to
-    /// the appropriate AWS-LC API.
+    /// suites are accepted in the same slice. A nonempty list is enforced
+    /// as an allowlist for both versions; a version with no listed suites
+    /// is disabled, subject to the configured protocol-version bounds.
     ///
     /// Overrides [`Self::ktls_aead_only`] when both are set — the
     /// user-supplied list wins.
@@ -244,6 +247,8 @@ impl ServerConfigBuilder {
     /// `key` is a DER-encoded private key in PKCS#8, PKCS#1 (RSA), or
     /// SEC1 (EC) format; the algorithm is auto-detected via
     /// [`d2i_AutoPrivateKey`](aws_lc_sys::d2i_AutoPrivateKey).
+    /// Each certificate slice and `key` must contain exactly one object;
+    /// trailing bytes or concatenated objects are rejected.
     ///
     /// Use this when interfacing with tooling that already produces DER
     /// (HSMs, KMS exports, ASN.1 generators) and avoid a PEM

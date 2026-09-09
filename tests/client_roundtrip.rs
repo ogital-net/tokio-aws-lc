@@ -105,7 +105,7 @@ async fn server_and_client_round_trip_in_process() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shutdown_survives_peer_dropping_socket_without_close_notify() {
+async fn shutdown_reports_peer_reset_without_close_notify() {
     let server_cfg = Arc::new(
         ServerConfig::builder()
             .with_pem_bytes(CERT_PEM, KEY_PEM)
@@ -136,10 +136,17 @@ async fn shutdown_survives_peer_dropping_socket_without_close_notify() {
         // Wait for the client to abort its TCP socket before shutting
         // down, so the server observes a deterministic EOF race.
         peer_gone_rx.await.expect("client signaled abort");
-        stream
+        let error = stream
             .shutdown()
             .await
-            .expect("server shutdown must succeed");
+            .expect_err("peer reset must not be hidden");
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+            ),
+            "unexpected shutdown error: {error}"
+        );
     });
 
     let client = tokio::spawn(async move {

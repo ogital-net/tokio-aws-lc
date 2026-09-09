@@ -106,9 +106,9 @@ impl ClientConfigBuilder {
     }
 
     /// Use a list of DER-encoded certificates as the only trust
-    /// anchors. Each element of `certs` is one DER `Certificate`
-    /// body. Avoids the PEM round-trip when integrating with tooling
-    /// that already emits DER (HSM exports, ASN.1 generators).
+    /// anchors. Each element of `certs` must contain exactly one DER
+    /// `Certificate`; trailing bytes or concatenated objects are rejected
+    /// at build time. Avoids the PEM round-trip for tooling that emits DER.
     #[must_use]
     pub fn with_root_certs_der_bytes(mut self, certs: &[&[u8]]) -> Self {
         self.roots = Roots::Der(certs.iter().map(|c| c.to_vec()).collect());
@@ -162,7 +162,9 @@ impl ClientConfigBuilder {
     /// handshake when the server requests a client certificate (mTLS).
     /// `cert_chain` is a slice of DER-encoded `Certificate` bodies in
     /// chain order (leaf first); `key` is a DER-encoded private key in
-    /// PKCS#8, PKCS#1, or SEC1 format.
+    /// PKCS#8, PKCS#1, or SEC1 format. Each certificate slice and `key`
+    /// must contain exactly one object; trailing bytes or concatenated
+    /// objects are rejected at build time.
     #[must_use]
     pub fn with_client_auth_der_bytes(mut self, cert_chain: &[&[u8]], key: &[u8]) -> Self {
         self.client_auth = Some(ClientAuth::Der {
@@ -174,8 +176,9 @@ impl ClientConfigBuilder {
 
     /// Restrict the offered cipher suites to the given set, using the
     /// typed constants in [`crate::cipher_suite`]. TLS 1.2 and TLS 1.3
-    /// suites are accepted in the same slice; the builder routes each to
-    /// the appropriate AWS-LC API.
+    /// suites are accepted in the same slice. A nonempty list is enforced
+    /// as an allowlist for both versions; a version with no listed suites
+    /// is disabled, subject to the configured protocol-version bounds.
     ///
     /// An empty slice clears any cipher-suite override and falls back
     /// to AWS-LC's defaults.
@@ -214,11 +217,15 @@ impl ClientConfigBuilder {
     /// Disable kTLS for streams produced by this config.
     ///
     /// By default, [`crate::TlsConnector::connect`] attempts to install
-    /// the Linux kernel `tls` ULP automatically once the handshake
-    /// finishes, falling back silently to userspace AEAD when the host
-    /// kernel does not support it. Calling this disables that attempt
-    /// outright; see [`crate::ServerConfigBuilder::disable_ktls`] for
-    /// the rationale.
+    /// Linux kTLS after the handshake. Unsupported hosts or sessions and
+    /// rejection before either direction is active fall back silently to
+    /// userspace AEAD. RX is installed first; a TX failure after RX succeeds
+    /// is fatal and closes the socket, with no rollback or fallback.
+    ///
+    /// Calling this skips the attempt and keeps streams in userspace. Use
+    /// it when post-handshake support is required: with kTLS active, all
+    /// handshake controls (including `NewSessionTicket` and `KeyUpdate`)
+    /// cause a terminal `io::ErrorKind::Unsupported` read error.
     #[must_use]
     pub fn disable_ktls(mut self) -> Self {
         self.ktls_disabled = true;
