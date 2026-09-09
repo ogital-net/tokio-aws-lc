@@ -481,6 +481,9 @@ fn skip_ktls(reason: impl std::fmt::Display) -> bool {
     false
 }
 
+// `async` is required so the call site's `.await` works uniformly across
+// platforms; only the Linux branch actually awaits anything.
+#[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]
 async fn ktls_supported(version: ProtocolVersion) -> bool {
     if !host_ktls_available() {
         return skip_ktls("host kTLS is unavailable/not supported");
