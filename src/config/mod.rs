@@ -59,7 +59,7 @@ pub(crate) fn iter_alpn_wire(mut buf: &[u8]) -> impl Iterator<Item = &[u8]> {
 
 /// Encode a list of ALPN protocols into AWS-LC's wire format
 /// (`<len><bytes>` repeated). Returns `Err` if any protocol is empty or
-/// longer than 255 bytes — both are spec violations.
+/// longer than 255 bytes - both are spec violations.
 pub(crate) fn encode_alpn_wire(protos: &[&[u8]]) -> Result<Vec<u8>, AlpnEncodeError> {
     let mut out = Vec::with_capacity(protos.iter().map(|p| p.len() + 1).sum());
     for p in protos {

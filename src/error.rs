@@ -1,13 +1,10 @@
-//! Crate-wide error type and AWS-LC error-queue drainer.
+//! Crate error type and AWS-LC error-queue drain.
 //!
-//! [`Error`] is hand-rolled rather than `thiserror`-derived so the crate
-//! pulls no extra runtime dependency for a small surface. Variants are
-//! lifecycle-ordered: callers typically see `Init` once at startup, then
-//! `Handshake` per connection, then `Io` (and on Linux `Ktls`) on the
-//! steady-state path. The `AsyncRead` / `AsyncWrite` impls on `TlsStream`
-//! return plain `std::io::Error` so framed codecs and `tokio::io::copy`
-//! work without conversion; this enum is for the parts of the API that
-//! are *not* on the read/write hot path.
+//! [`Error`] stays hand-rolled to avoid extra deps. Variants run in
+//! lifecycle order: `Init` at startup, `Handshake` per connection, then
+//! `Io` (and on Linux `Ktls`) on the steady-state path. The `AsyncRead`
+//! / `AsyncWrite` impls on `TlsStream` return plain `std::io::Error`;
+//! this enum covers the rest of the API.
 
 use std::ffi::CStr;
 use std::fmt;
@@ -40,14 +37,11 @@ pub enum KtlsError {
     Unsupported,
     /// Negotiated cipher / TLS version cannot be offloaded.
     IneligibleCipher { tls_version: String, cipher: String },
-    /// libssl has buffered data — decrypted plaintext, or undecrypted
-    /// transport bytes (e.g. the peer's first application record
-    /// coalesced into the handshake's final TCP segment) — sitting in
-    /// its internal buffer at the moment of install. Installing kTLS
-    /// now would silently drop those bytes because the kernel takes
-    /// over the read path and only sees what arrives on the wire
-    /// afterwards. The payload is the number of *decrypted* bytes
-    /// libssl had buffered (`SSL_pending`), which may be 0 when only
+    /// libssl holds buffered data at install time: decrypted plaintext or
+    /// undecrypted transport bytes (for example a first application record
+    /// coalesced with the handshake tail). Install would drop those bytes
+    /// because the kernel reads only new wire data. The payload holds the
+    /// `SSL_pending` decrypted-byte count; it can read 0 when only
     /// undecrypted transport data is present.
     BufferedPlaintext(usize),
     /// The kernel rejected `setsockopt(SOL_TCP, TCP_ULP, "tls")` with
@@ -58,8 +52,8 @@ pub enum KtlsError {
     ///
     /// Fix: `sudo modprobe tls` (or add `tls` to
     /// `/etc/modules-load.d/`). Inside a container, the *host* kernel
-    /// must provide the module — `modprobe` from inside the container
-    /// will not help.
+    /// must provide the module; `modprobe` inside the container has no
+    /// effect.
     TlsUlpUnavailable(io::Error),
     /// The `tls` ULP exists on the host, but the kernel refused to
     /// attach it to *this particular socket* (typically `ENOTCONN`
@@ -180,13 +174,12 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 ///
 /// Call this immediately after any fallible AWS-LC FFI returns its sentinel
 /// (`NULL`, `0`, `<= 0` depending on the function). Leaving entries in the
-/// queue is the most common foot-gun in the OpenSSL ABI: the next failing
-/// call's diagnostic gets prepended with a stale code from a previous
-/// failure on the same thread.
+/// queue is the most common trap in the OpenSSL ABI: the next failing
+/// call picks up a stale code from an earlier failure on the same thread.
 ///
-/// Returns `"(no error queued)"` when the queue was already empty — useful
-/// only for diagnostic strings; treat it as a bug if the call site really
-/// expected an error.
+/// Returns `"(no error queued)"` when the queue is empty. Use for
+/// diagnostic strings only; a call site that expects an error must not
+/// see it.
 #[must_use]
 pub fn last_error() -> String {
     // SAFETY: ERR_get_error has no arguments and is documented to return 0
@@ -240,12 +233,12 @@ pub(crate) fn pem_eof_or_err(label: &str) -> Result<()> {
     // most recently queued error packed code (0 if the queue is empty).
     let packed = unsafe { aws_lc_sys::ERR_peek_last_error() };
     if packed == 0 {
-        // No error queued at all — treat as clean EOF.
+        // No error queued at all; treat as clean EOF.
         return Ok(());
     }
-    // OpenSSL-style packed-error layout (matches aws-lc-sys's
-    // ERR_GET_LIB_RUST / ERR_GET_REASON_RUST helpers — which bindgen
-    // surfaces but aws-lc does not export as link-time symbols).
+    // OpenSSL-style packed-error layout (matches aws-lc-sys ERR_GET_LIB
+    // / ERR_GET_REASON helpers, which bindgen surfaces but AWS-LC does
+    // not export as link-time symbols).
     // Library is the top byte; reason is the low 12 bits.
     #[allow(clippy::cast_possible_wrap)]
     let lib = ((packed >> 24) & 0xff) as c_int;

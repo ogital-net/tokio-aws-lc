@@ -34,8 +34,8 @@ impl ClientConfig {
         ClientConfigBuilder::default()
     }
 
-    /// Raw access to the underlying `SSL_CTX` pointer. Used by
-    /// [`crate::TlsConnector`] when minting per-connection `SSL` handles.
+    /// Raw access to the `SSL_CTX` pointer. Used by [`crate::TlsConnector`]
+    /// to create per-connection `SSL` handles.
     pub(crate) fn ctx_ptr(&self) -> *mut aws_lc_sys::SSL_CTX {
         self.ctx.as_ptr()
     }
@@ -346,9 +346,8 @@ impl ClientConfigBuilder {
             named_group::apply_to_ctx(&ctx, groups)?;
         }
 
-        // ALPN: client-side just hands over the wire-encoded list. AWS-LC
-        // copies the buffer internally, so the local Vec can be dropped
-        // at the end of this scope.
+        // ALPN: hand over the wire-encoded list. AWS-LC copies the
+        // buffer, so the local Vec can drop at the end of this scope.
         if !self.alpn_protocols.is_empty() {
             let refs: Vec<&[u8]> = self.alpn_protocols.iter().map(Vec::as_slice).collect();
             let wire = encode_alpn_wire(&refs)
@@ -357,8 +356,8 @@ impl ClientConfigBuilder {
             let ok = unsafe {
                 aws_lc_sys::SSL_CTX_set_alpn_protos(ctx.as_ptr(), wire.as_ptr(), wire.len())
             };
-            // SSL_CTX_set_alpn_protos returns 0 on success (legacy OpenSSL
-            // ABI quirk inherited by AWS-LC).
+            // SSL_CTX_set_alpn_protos returns 0 on success (an OpenSSL
+            // ABI convention AWS-LC keeps).
             if ok != 0 {
                 return Err(Error::Init(format!(
                     "SSL_CTX_set_alpn_protos: {}",
@@ -617,8 +616,8 @@ fn load_client_private_key_der(ctx: &SslCtx, der: &[u8]) -> Result<()> {
 struct BioGuard(*mut aws_lc_sys::BIO);
 impl Drop for BioGuard {
     fn drop(&mut self) {
-        // SAFETY: `self.0` was obtained from BIO_new_* and was not handed
-        // off; we own the free.
+        // SAFETY: `self.0` comes from BIO_new_* and was never handed
+        // off; this owns the free.
         unsafe {
             aws_lc_sys::BIO_free(self.0);
         }

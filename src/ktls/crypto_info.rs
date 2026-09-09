@@ -1,23 +1,20 @@
 //! `#[repr(C)]` mirrors of `<linux/tls.h>` `tls12_crypto_info_*` layouts,
-//! plus the constants the kernel UAPI keys them off.
+//! plus the kernel UAPI constants.
 //!
-//! Sizes are pinned by compile-time `assert!`s in [`tests`]: the wire
-//! layout is fixed by the kernel ABI and any drift here would silently
-//! corrupt a setsockopt call, so we'd rather fail compilation than
-//! discover a one-byte gap at runtime.
+//! Compile-time `assert!`s in [`tests`] pin the sizes: the kernel ABI
+//! fixes the wire layout, so a mismatch fails the build instead of
+//! corrupting a setsockopt call.
 //!
-//! Defined here, used from the Linux-only dispatcher in
-//! [`super`]. The structs themselves are platform-neutral (just
-//! `repr(C)` Plain-Old-Data) so they live in this submodule and can be
-//! exercised by unit tests on any host.
+//! The Linux-only dispatcher in [`super`] uses these. The structs are
+//! platform-neutral `repr(C)` data, so unit tests run on any host.
 
 #![allow(non_camel_case_types)]
 
-/// `SOL_TLS` — kernel TLS setsockopt level (`include/uapi/linux/tls.h`).
+/// `SOL_TLS`: kernel TLS setsockopt level (`include/uapi/linux/tls.h`).
 #[cfg(target_os = "linux")]
 pub const SOL_TLS: i32 = 282;
-/// `TCP_ULP` — TCP-level setsockopt that selects an Upper Layer
-/// Protocol. Passing `"tls"` flips this socket into kTLS mode.
+/// `TCP_ULP`: TCP setsockopt that selects an Upper Layer Protocol.
+/// Passing `"tls"` moves the socket into kTLS mode.
 #[cfg(target_os = "linux")]
 pub const TCP_ULP: i32 = 31;
 /// `SOL_TCP`. Hard-coded rather than pulled from `libc` to keep
@@ -60,8 +57,8 @@ pub const CHACHA20_POLY1305_SALT_LEN: usize = 0;
 /// TLS record sequence number, big-endian.
 pub const TLS_REC_SEQ_LEN: usize = 8;
 
-/// Mirrors `struct tls_crypto_info` from `<linux/tls.h>` — the common
-/// header on every `tls12_crypto_info_*`.
+/// Mirrors `struct tls_crypto_info` from `<linux/tls.h>`: the common
+/// header on each `tls12_crypto_info_*`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct tls_crypto_info {
@@ -106,9 +103,9 @@ pub struct tls12_crypto_info_chacha20_poly1305 {
     pub rec_seq: [u8; TLS_REC_SEQ_LEN],
 }
 
-// Sizes are checked at compile time. Any mismatch with the kernel UAPI
-// (e.g. someone "helpfully" reorders a field) breaks the build rather
-// than producing a corrupted setsockopt call.
+// Sizes are checked at compile time. A mismatch with the kernel UAPI
+// (for example a reordered field) breaks the build instead of
+// corrupting a setsockopt call.
 const _: () = assert!(std::mem::size_of::<tls_crypto_info>() == 4);
 const _: () = assert!(std::mem::size_of::<tls12_crypto_info_aes_gcm_128>() == 40);
 const _: () = assert!(std::mem::size_of::<tls12_crypto_info_aes_gcm_256>() == 56);

@@ -45,7 +45,7 @@ async fn server_and_client_round_trip_in_process() {
         let echoed = &buf[..n];
         assert_eq!(echoed, b"pong from client");
         let negotiated = stream.negotiated();
-        // RFC 5705 keying-material exporter — exercise both the
+        // RFC 5705 keying-material exporter. Exercise both the
         // context-less and contextual paths and compare against the
         // peer at the end of the test.
         let mut ekm_no_ctx = [0u8; 32];
@@ -452,7 +452,7 @@ async fn client_rejects_untrusted_server_cert() {
     );
     let acceptor = TlsAcceptor::new(server_cfg);
 
-    // No `with_root_certs_pem_bytes` — falls through to system roots,
+    // No `with_root_certs_pem_bytes`; falls through to system roots,
     // which (in CI and locally) do not trust our self-signed cert.
     let client_cfg = Arc::new(
         ClientConfig::builder()
@@ -481,8 +481,7 @@ async fn client_rejects_untrusted_server_cert() {
 }
 
 /// `dangerous_disable_verification` is the documented escape hatch for
-/// test scenarios. Verify it actually disables verification (otherwise
-/// the method is a footgun without the foot).
+/// test scenarios. Verify it actually disables verification.
 #[tokio::test]
 async fn dangerous_disable_verification_accepts_untrusted() {
     let server_cfg = Arc::new(
@@ -510,7 +509,7 @@ async fn dangerous_disable_verification_accepts_untrusted() {
     });
 
     let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    // Use a hostname that wouldn't pass verification either — the
+    // Use a hostname that would not pass verification either; the
     // dangerous mode must skip both chain validation *and* hostname
     // checks.
     let mut stream = connector
@@ -565,15 +564,13 @@ async fn mtls_optional_accepts_client_without_cert() {
     server.await.unwrap();
 }
 
-/// When `ClientAuthMode::Required` is in effect, the server's client-CA
-/// trust store must contain *only* the explicitly provided private CA
-/// roots — not the system trust store. A client presenting a cert that
-/// is neither in the configured roots nor signed by them must be
-/// rejected, even if it would be accepted by the host's system CAs.
-///
-/// This guards against a regression where someone "helpfully" calls
-/// `SSL_CTX_set_default_verify_paths` on the server CTX during build:
-/// that would silently widen the trust set on the client-auth path.
+/// When `ClientAuthMode::Required` is in effect, the server client-CA
+/// trust store holds only the explicitly provided private CA roots, not
+/// the system trust store. A client cert outside the configured roots or
+/// not signed by them must fail, even if the host system CAs would accept
+/// it. This guards against a change that calls
+/// `SSL_CTX_set_default_verify_paths` on the server CTX during build and
+/// silently widens the trust set on the client-auth path.
 #[tokio::test]
 async fn mtls_required_rejects_cert_outside_private_roots() {
     // Cert + key independent of CERT_PEM/KEY_PEM. Self-signed P-256;
@@ -618,10 +615,10 @@ async fn mtls_required_rejects_cert_outside_private_roots() {
             .await
             .expect("tcp connect");
         // In TLS 1.3 mutual auth the client can finish its handshake
-        // before the server has processed the client's certificate, so
-        // `connect()` itself may succeed — the alert arrives on the
-        // next read. Either path is acceptable; what we forbid is a
-        // successful read/write round-trip with an untrusted client
+        // before the server has processed the client certificate, so
+        // `connect()` itself may succeed; the alert arrives on the
+        // next read. Either path is acceptable; what the test forbids is
+        // a successful read/write round trip with an untrusted client
         // cert.
         match connector.connect("localhost", tcp).await {
             Err(_) => {}
@@ -647,7 +644,7 @@ async fn mtls_required_rejects_cert_outside_private_roots() {
 // Targeted contracts on `TlsConnector::connect`:
 //   * empty server_name is rejected up-front,
 //   * IP literals route through X509 iPAddress SAN matching rather than
-//     SNI + DNS-SAN matching (RFC 6066 §3),
+//     SNI + DNS-SAN matching (RFC 6066 Sec 3),
 //   * ALPN mismatch fails the handshake with a fatal alert instead of
 //     silently completing with no negotiated protocol.
 // ---------------------------------------------------------------------
@@ -662,9 +659,9 @@ async fn connect_rejects_empty_server_name() {
     );
     let connector = TlsConnector::new(client_cfg);
 
-    // We never actually open a TCP connection — the empty-name check
-    // happens before any FD work — but `connect` takes ownership of a
-    // TcpStream, so synthesise one with a never-connecting listener.
+    // No TCP connection opens here; the empty-name check runs before any
+    // FD work. `connect` takes ownership of a TcpStream, so synthesise one
+    // with a never-connecting listener.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
@@ -810,8 +807,8 @@ async fn alpn_mismatch_fails_handshake_with_fatal_alert() {
             .expect_err("ALPN mismatch must abort the handshake");
         let msg = format!("{err}");
         // Either the alert text mentions "no_application_protocol" or
-        // the handshake error is surfaced — both are acceptable; we
-        // just don't want a silent success.
+        // the handshake error surfaces; both are acceptable. The test only
+        // forbids a silent success.
         assert!(
             msg.to_lowercase().contains("handshake")
                 || msg.to_lowercase().contains("alert")

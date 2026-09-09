@@ -51,7 +51,7 @@ impl KtlsCipher {
     /// Pure mapping from raw `(version, IANA cipher-suite ID)` to the
     /// typed variant. Split out so it can be unit-tested without an SSL.
     fn from_ids(tls_version: c_int, cipher_id: u16) -> Option<Self> {
-        // IANA cipher suite IDs, RFC 8446 §B.4 (TLS 1.3) and RFC 5288 /
+        // IANA cipher suite IDs, RFC 8446 App B.4 (TLS 1.3) and RFC 5288 /
         // RFC 7905 (TLS 1.2 AEAD).
         const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
         const TLS_AES_256_GCM_SHA384: u16 = 0x1302;

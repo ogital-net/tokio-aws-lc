@@ -1,20 +1,17 @@
 //! Per-direction key/IV/salt/sequence derivation for kTLS install.
 //!
-//! TLS 1.3 (RFC 8446 §7.3): pull the per-direction application traffic
-//! secret out of libssl, run HKDF-Expand-Label with labels `"key"` and
+//! TLS 1.3 (RFC 8446 Sec 7.3): read the per-direction application traffic
+//! secret from libssl, run HKDF-Expand-Label with labels `"key"` and
 //! `"iv"` to derive the AEAD key and the 12-byte static IV.
 //!
-//! TLS 1.2 (RFC 5246 §6.3, RFC 5288 §3, RFC 7905 §2): expand a single
+//! TLS 1.2 (RFC 5246 Sec 6.3, RFC 5288 Sec 3, RFC 7905 Sec 2): expand one
 //! PRF key block from the master secret, split into
 //! `client_write_key | server_write_key | client_write_IV | server_write_IV`
-//! (no MAC keys — AEAD ciphersuites have zero-length MAC keys), and
-//! pick the right half based on whether this endpoint is the server
-//! or client. The "write" direction from this endpoint's perspective
-//! is what becomes `TLS_TX`.
+//! (no MAC keys; AEAD suites use zero-length MAC keys), and select the
+//! half for this endpoint. The local write side becomes `TLS_TX`.
 //!
-//! Pure logic: this module does not touch sockets or the kernel. It is
-//! cross-platform on purpose so the HKDF-Expand-Label vectors can be
-//! unit-tested on macOS too.
+//! Pure logic with no socket or kernel use. It stays cross-platform so
+//! HKDF-Expand-Label vectors run in unit tests on macOS too.
 
 use crate::error::{last_error, Error, Result};
 use crate::ffi::Ssl;
@@ -39,7 +36,7 @@ impl Hash {
     }
 }
 
-/// TLS 1.3 HKDF-Expand-Label (RFC 8446 §7.1):
+/// TLS 1.3 HKDF-Expand-Label (RFC 8446 Sec 7.1):
 ///
 /// ```text
 /// HkdfLabel = {
@@ -107,9 +104,8 @@ pub(crate) enum Direction {
     Read,
 }
 
-/// Pull a TLS 1.3 traffic secret of the given hash's output length.
-/// Errors out on length mismatch — the caller pins the size against
-/// the negotiated hash.
+/// Read a TLS 1.3 traffic secret of the hash output length. Fails on
+/// length mismatch; the caller pins the size to the negotiated hash.
 pub(crate) fn tls13_traffic_secret(
     ssl: &Ssl,
     dir: Direction,

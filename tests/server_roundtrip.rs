@@ -1,4 +1,4 @@
-//! M2 wire-level test: drive `openssl s_client` against a real
+//! wire-level test: drive `openssl s_client` against a real
 //! `TlsAcceptor` and verify the handshake + server-initiated write +
 //! shutdown all work end-to-end.
 //!
@@ -90,7 +90,7 @@ async fn handshake_and_server_write_against_openssl_s_client() {
         "openssl stdout did not contain greeting.\nstdout: {stdout}\nstderr: {stderr}\nnegotiated: {negotiated:?}"
     );
 
-    // ALPN sanity: we offered h2 and http/1.1; the server should select
+    // ALPN check: the client offers h2 and http/1.1; the server picks
     // the first match (h2).
     assert_eq!(
         negotiated.alpn(),
@@ -98,7 +98,7 @@ async fn handshake_and_server_write_against_openssl_s_client() {
         "expected ALPN=h2"
     );
 
-    // SNI sanity: openssl sends "localhost".
+    // SNI check: openssl sends "localhost".
     assert_eq!(negotiated.sni(), Some("localhost"));
 }
 

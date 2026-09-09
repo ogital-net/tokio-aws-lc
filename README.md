@@ -38,9 +38,9 @@ using AWS-LC's TLS engine. It is not.
   library: AEAD primitives (AES-GCM, ChaCha20-Poly1305), HKDF,
   signature verification (RSA, ECDSA, `EdDSA`), key exchange (X25519,
   the NIST P-curves, the hybrid PQ groups), and the TLS 1.2 PRF.
-  Everything else — the TLS state machine, the record layer, the
-  handshake, X.509 chain validation (via `webpki`), SNI, ALPN,
-  session tickets — is rustls's own pure-Rust code. `aws-lc-rs`
+  Everything else, including the TLS state machine, the record layer,
+  the handshake, X.509 chain validation (via `webpki`), SNI, ALPN,
+  and session tickets, is rustls's own pure-Rust code. `aws-lc-rs`
   exposes a ring-compatible API on top of `aws-lc-sys` so rustls can
   swap providers; nothing in `libssl` is reachable from there.
 - **`tokio-aws-lc`** uses AWS-LC's `libssl`. The TLS state machine,
@@ -50,14 +50,13 @@ using AWS-LC's TLS engine. It is not.
   `ClientConfig` builders are thin wrappers that translate typed
   configuration into `SSL_CTX_set_*` calls.
 
-That difference is what makes the kTLS path tractable here:
-extracting the post-handshake traffic keys and sequence numbers is a
-sequence of `SSL_*` getters in `libssl`, and there's nowhere in
-rustls's public API to reach them without forking. It is also why
-behavior around things like client-cert verification, IP-SAN
-matching, and protocol-version selection follows AWS-LC's
-conventions rather than rustls's — the builder API hides the FFI but
-not the semantics.
+That difference makes the kTLS path tractable here: extracting the
+post-handshake traffic keys and sequence numbers is a sequence of
+`SSL_*` getters in `libssl`, and rustls's public API has no path to
+reach them without forking. It also explains why behavior around
+client-cert verification, IP-SAN matching, and protocol-version
+selection follows AWS-LC's conventions rather than rustls's: the
+builder API hides the FFI but not the semantics.
 
 ## Status
 
@@ -153,7 +152,7 @@ tls.read_to_end(&mut body).await?;
 
 `TlsConnector::connect` accepts both DNS names and IP literals. DNS
 names go out as the SNI extension and are matched against the
-certificate's DNS SANs / CN; IP literals skip SNI (RFC 6066 §3) and
+certificate's DNS SANs / CN; IP literals skip SNI (RFC 6066 Sec 3) and
 are matched against the certificate's iPAddress SANs.
 
 ### Userspace writes
@@ -216,7 +215,7 @@ without touching a real session.
 
 Host prerequisites:
 
-- Kernel ≥ 5.1 for TLS 1.3 (AES-GCM TX is 4.13+, AES-GCM RX is 4.17+,
+- Kernel 5.1 or newer for TLS 1.3 (AES-GCM TX is 4.13+, AES-GCM RX is 4.17+,
   ChaCha20-Poly1305 is 5.11+).
 - `tls` module loaded (`sudo modprobe tls`, or add `tls` to
   `/etc/modules-load.d/`). Inside containers, the host kernel must

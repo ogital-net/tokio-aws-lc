@@ -1,27 +1,19 @@
-//! Typed cipher-suite constants for use with the server- and client-side
-//! config builders.
+//! Typed cipher-suite constants for the config builders.
 //!
-//! Shape and contents mirror `rustls::crypto::aws_lc_rs::cipher_suite`:
-//! each supported (TLS version, AEAD) tuple is exposed as a
-//! `&'static CipherSuite` constant. Hand a slice of references to
-//! [`crate::ServerConfigBuilder::cipher_suites`] or
-//! [`crate::ClientConfigBuilder::cipher_suites`] to pin the negotiation
-//! to that set; callers don't have to spell out OpenSSL cipher-list
-//! grammar by hand.
+//! Each supported (TLS version, AEAD) pair is a `&'static CipherSuite`
+//! constant. Pass a slice to [`crate::ServerConfigBuilder::cipher_suites`]
+//! or [`crate::ClientConfigBuilder::cipher_suites`] to pin negotiation
+//! to that set.
 //!
-//! A non-empty set disables any TLS version for which it contains no
-//! suites, without changing the configured minimum or maximum version.
-//! An empty set leaves AWS-LC's defaults in place.
+//! A non-empty set disables any TLS version with no listed suites; it
+//! leaves the min/max version bounds as is. An empty set keeps AWS-LC
+//! defaults.
 //!
-//! Only AEAD suites (AES-GCM, ChaCha20-Poly1305) are exposed, matching
-//! the rustls aws-lc-rs provider's modern-only stance. CBC-SHA, RC4,
-//! and other legacy suites are deliberately not provided. The same
-//! subset happens to be what the Linux kernel `tls` ULP can offload,
-//! so kTLS auto-install on accept/connect succeeds on any negotiation
-//! built from these constants. Sessions whose negotiation isn't
-//! kTLS-eligible (for example because a peer pinned one of these suites
-//! that the kernel doesn't support on the running host) simply run the
-//! AEAD record layer in userspace.
+//! Only AEAD suites (AES-GCM, ChaCha20-Poly1305) appear here. No CBC-SHA,
+//! RC4, or other legacy suites. This set matches what the Linux kernel
+//! `tls` ULP offloads, so kTLS install on accept/connect succeeds for
+//! any negotiation built from these constants. Other negotiations run
+//! the AEAD record layer in userspace.
 //!
 //! ```no_run
 //! use tokio_aws_lc::cipher_suite::{
@@ -85,7 +77,7 @@ impl CipherSuite {
     }
 }
 
-// TLS 1.3 ciphersuites — OpenSSL/AWS-LC accepts them via
+// TLS 1.3 ciphersuites - OpenSSL/AWS-LC accepts them via
 // `SSL_CTX_set_ciphersuites` under their IANA names.
 
 /// `TLS_AES_128_GCM_SHA256` (TLS 1.3).
@@ -112,7 +104,7 @@ pub static TLS13_CHACHA20_POLY1305_SHA256: &CipherSuite = &CipherSuite {
     version: ProtocolVersion::Tls13,
 };
 
-// TLS 1.2 AEAD ciphersuites — OpenSSL/AWS-LC accepts them via
+// TLS 1.2 AEAD ciphersuites - OpenSSL/AWS-LC accepts them via
 // `SSL_CTX_set_cipher_list` under the OpenSSL cipher-list name (e.g.
 // "ECDHE-ECDSA-AES128-GCM-SHA256"). RFC 5288 (AES-GCM) + RFC 7905
 // (ChaCha20-Poly1305).
@@ -184,11 +176,9 @@ pub static ALL_CIPHER_SUITES: &[&CipherSuite] = &[
 
 /// Cipher-suite configuration an application should use by default.
 ///
-/// Currently identical to [`ALL_CIPHER_SUITES`], mirroring the
-/// `rustls::crypto::aws_lc_rs::DEFAULT_CIPHER_SUITES` shape. Exposed
-/// separately so the default set can shrink in a future release
-/// (e.g. dropping a suite from the default while leaving it available
-/// for callers that opt in explicitly) without a breaking change.
+/// Currently identical to [`ALL_CIPHER_SUITES`]. Kept as a separate name
+/// so the default set can shrink later without a breaking change, while
+/// the full list stays available for callers that opt in explicitly.
 pub static DEFAULT_CIPHER_SUITES: &[&CipherSuite] = ALL_CIPHER_SUITES;
 
 /// Helper used by both builders. Splits `suites` into TLS 1.2 and TLS

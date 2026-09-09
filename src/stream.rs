@@ -75,12 +75,11 @@ impl Wake for IoWaiters {
 /// Call `flush()` or `shutdown()` to finish sending it. A write returning
 /// `Pending` has not accepted any bytes from that call's buffer.
 pub struct TlsStream {
-    // Field order matters for Drop: `ssl` first (frees the SSL, which
-    // drops one refcount on the SSL_CTX — the CTX-owned ALPN buffer
-    // and any other ex_data are released when the last refcount goes,
-    // typically when the producing config is also dropped); then `tcp`
-    // closes the socket. The SSL's BIO uses BIO_NOCLOSE so the SSL
-    // never touches the fd.
+    // Field order matters for Drop: `ssl` drops first, freeing the SSL
+    // and dropping one SSL_CTX refcount (the CTX-owned ALPN buffer and
+    // other ex_data release when the last refcount clears, usually when
+    // the producing config also drops); then `tcp` closes the socket.
+    // The SSL's BIO uses BIO_NOCLOSE so the SSL never touches the fd.
     ssl: Ssl,
     tcp: TcpStream,
     /// `true` once kTLS has been installed: the read/write path then
@@ -212,12 +211,11 @@ impl TlsStream {
         unsafe { NegotiatedSession::from_ssl(self.ssl.as_ptr()) }
     }
 
-    /// Whether the current session is structurally eligible for Linux
-    /// kTLS offload. Does *not* check the host kernel; auto-install
-    /// runs on handshake completion. Rejections before either direction
-    /// is active fall back to userspace; partial installs fail closed. Observe
-    /// [`Self::ktls_active`] to confirm whether the kernel actually
-    /// took over the data path.
+    /// Whether the session can offload to Linux kTLS. Skips the host
+    /// kernel check; auto-install runs at handshake completion.
+    /// Rejections before either direction goes active fall back to
+    /// userspace; partial installs fail closed. Check
+    /// [`Self::ktls_active`] for the active data path.
     #[must_use]
     pub fn ktls_eligibility(&self) -> KtlsEligibility {
         // SAFETY: ssl is live and post-handshake.
@@ -242,23 +240,19 @@ impl TlsStream {
         self.ktls_disabled
     }
 
-    /// Post-handshake auto-install entry point. Called by the
-    /// acceptor/connector after the handshake completes, unless the
-    /// producing config opted out via `disable_ktls()`. Swallows the
-    /// failure modes that indicate kTLS is structurally unavailable on
-    /// this host / for this negotiation (`Unsupported`,
-    /// `IneligibleCipher`, `TlsUlpUnavailable`, `SocketUnattachable`,
-    /// `CryptoUnavailable`)
-    /// so the stream silently continues on the userspace path.
-    /// RX is installed first. Its rejection leaves both directions on
-    /// TCP; a subsequent TX failure leaves RX active and is fatal.
+    /// Post-handshake auto-install entry point. Runs after the handshake
+    /// unless the config sets `disable_ktls()`. Skips install on
+    /// structural errors (`Unsupported`, `IneligibleCipher`,
+    /// `TlsUlpUnavailable`, `SocketUnattachable`, `CryptoUnavailable`)
+    /// and keeps the stream on userspace. Installs RX first; RX rejection
+    /// leaves both directions on TCP, while a later TX failure leaves
+    /// RX active and fails the connection.
     ///
-    /// On Linux the kernel `tls` module must be loaded
-    /// (`sudo modprobe tls`, or add `tls` to `/etc/modules-load.d/`)
-    /// for kTLS to engage. Container workloads need the *host* kernel
-    /// to provide it. Call [`crate::host_ktls_available`] at startup
-    /// to branch on host support, or check [`Self::ktls_active`]
-    /// post-handshake to see whether the install actually happened.
+    /// On Linux the kernel `tls` module must load (`sudo modprobe tls`,
+    /// or add `tls` to `/etc/modules-load.d/`). Containers need the host
+    /// kernel to provide it. Call [`crate::host_ktls_available`] at
+    /// startup for host support, or check [`Self::ktls_active`]
+    /// post-handshake for the active path.
     ///
     /// # Post-handshake records
     ///
@@ -268,17 +262,16 @@ impl TlsStream {
     /// `KeyUpdate`, remain unsupported and produce a terminal error.
     /// Disable kTLS when these are needed; libssl then processes them.
     ///
-    /// Server-emitted post-handshake records cannot happen on this
-    /// crate's server path: tickets are disabled by construction
-    /// (`SSL_OP_NO_TICKET` + `SSL_CTX_set_num_tickets(0)`), and we do
-    /// not call `SSL_key_update` ourselves.
+    /// The server path emits no post-handshake records: tickets stay off
+    /// (`SSL_OP_NO_TICKET` + `SSL_CTX_set_num_tickets(0)`), and the code
+    /// never calls `SSL_key_update`.
     pub(crate) fn try_auto_install_ktls(&mut self) -> Result<()> {
         if self.ktls_active || self.ktls_disabled {
             return Ok(());
         }
         // Buffered (decrypted or undecrypted) data at install time is a
-        // transient, timing-dependent condition — not a structural
-        // "kTLS unavailable" one — so treat it like the other non-fatal
+        // transient, timing-dependent condition, not a structural
+        // "kTLS unavailable" one, so treat it like the other non-fatal
         // cases below: skip the install and let the connection proceed
         // on the userspace AEAD path, where libssl reads the buffered
         // bytes correctly. Failing the whole connection here would drop
@@ -502,10 +495,10 @@ fn ktls_poll_write(tcp: &TcpStream, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io
 
 /// Wait for read readiness, then force-clear the cached bit. libssl's
 /// BIO does the actual `recv(2)` outside tokio's bookkeeping, so we
-/// have to invalidate the cache after each `WANT_READ` ourselves —
-/// otherwise `poll_read_ready` would keep returning `Ready` from the
-/// stale notification and busy-loop. The `try_io(_, || Err(WouldBlock))`
-/// idiom is tokio's documented escape hatch for this.
+/// have to invalidate the cache after each `WANT_READ`; otherwise
+/// `poll_read_ready` keeps returning `Ready` from the stale notification
+/// and busy-loops. `try_io(_, || Err(WouldBlock))` is tokio's documented
+/// escape hatch for this.
 fn poll_clear_read_ready(tcp: &TcpStream, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
     match tcp.poll_read_ready(cx) {
         Poll::Ready(Ok(())) => {

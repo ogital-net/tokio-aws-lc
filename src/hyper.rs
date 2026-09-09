@@ -14,14 +14,13 @@
 //!   `hyper_util::client::legacy::Client::builder(...).build(https)`
 //!   the same way `hyper-rustls`'s `HttpsConnector` does.
 //!
-//! Familiar shape from `hyper-rustls` / `hyper-tls`: swap the `use`
-//! line and the connector constructor. No type-level compatibility is
-//! promised — concrete types differ.
+//! Swap the `use` line and the connector constructor to move from
+//! `hyper-rustls` / `hyper-tls`. No type-level compatibility exists;
+//! concrete types differ.
 //!
-//! ALPN policy: a fresh [`HttpsConnector`] does not mutate ALPN — it
-//! uses whatever the wrapped [`TlsConnector`]'s [`crate::ClientConfig`]
-//! was built with. Configure `["h2", "http/1.1"]` on the config builder
-//! if you want HTTP/2 negotiation.
+//! ALPN policy: a fresh [`HttpsConnector`] keeps the wrapped
+//! [`TlsConnector`]'s [`crate::ClientConfig`] ALPN as is. Configure
+//! `["h2", "http/1.1"]` on the config builder for HTTP/2.
 
 use std::future::Future;
 use std::io;
@@ -38,8 +37,7 @@ use crate::{TlsAcceptor, TlsConnector, TlsStream};
 
 /// Server-side acceptor adapter.
 ///
-/// Cheap to clone — it just holds the underlying [`TlsAcceptor`] which
-/// is itself `Arc`-backed.
+/// Cheap to clone; it holds the `Arc`-backed [`TlsAcceptor`] inside.
 #[derive(Clone, Debug)]
 pub struct HyperAcceptor {
     inner: TlsAcceptor,
@@ -95,8 +93,8 @@ impl HttpsConnector {
     }
 
     /// Build a connector from a pre-configured [`HttpConnector`]. The
-    /// caller is responsible for setting `enforce_http(false)` — this
-    /// constructor does *not* mutate the supplied connector.
+    /// caller sets `enforce_http(false)`; this constructor leaves the
+    /// supplied connector as is.
     #[must_use]
     pub fn with_http_connector(http: HttpConnector, tls: TlsConnector) -> Self {
         Self { http, tls }

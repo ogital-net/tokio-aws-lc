@@ -34,39 +34,28 @@ use self::derive::{
     tls13_traffic_secret, Direction, Hash,
 };
 
-/// Whether the host kernel exposes the `tls` ULP — i.e. whether
-/// the auto-install path on accept/connect has a chance of engaging
-/// on a session with a kTLS-eligible cipher.
+/// Whether the host kernel exposes the `tls` ULP and can run kTLS
+/// for an eligible session.
 ///
-/// Intended as a startup probe so consumers can branch on it (log a
-/// warning, fall back to userspace AEAD, gate a metric, etc.) without
-/// having to actually attempt an install on a real session.
+/// Use as a startup probe to branch (log, use userspace AEAD, gate a
+/// metric) without touching a live session.
 ///
 /// # How the probe works
 ///
-/// - **Non-Linux:** always returns `false`. kTLS has no analogue on
-///   macOS or any other supported target.
-/// - **Linux:** returns `true` iff `/proc/net/tls_stat` exists. That
-///   file is created by `tls_init()` in the kernel module, so it is
-///   present exactly when the `tls` module is loaded or
-///   `CONFIG_TLS=y` is built in — which is the same condition that
-///   `setsockopt(SOL_TCP, TCP_ULP, "tls")` checks. A real
-///   `setsockopt` probe would need a connected loopback socket
-///   (`tls_init` rejects non-`ESTABLISHED` sockets with `ENOTCONN`);
-///   the proc-file check matches the same condition at zero syscalls.
+/// - Non-Linux: always returns `false`. No kTLS analogue exists there.
+/// - Linux: returns `true` when `/proc/net/tls_stat` exists. The file
+///   appears when the `tls` module loads or `CONFIG_TLS=y` is built in,
+///   which matches the `setsockopt(SOL_TCP, TCP_ULP, "tls")` check. A
+///   live `setsockopt` probe needs a connected socket; the proc-file
+///   check tests the same state with no syscalls.
 ///
-/// This is a structural probe of the kernel's kTLS support, not of
-/// the negotiated session. Whether a given handshake can actually be
-/// offloaded also depends on the cipher — use
-/// [`crate::TlsStream::ktls_eligibility`] on the post-handshake
-/// stream for that check.
+/// This probes kernel support, not the negotiated session. Check the
+/// cipher with [`crate::TlsStream::ktls_eligibility`] post-handshake.
 ///
-/// On a host where this returns `false`, the crate continues to work
-/// in userspace-AEAD mode: handshakes, reads, and writes all go
-/// through `libssl` as normal, and the auto-install path on
-/// accept/connect silently no-ops (load the module with
-/// `modprobe tls` or build the kernel with `CONFIG_TLS=y` to enable
-/// kTLS).
+/// When this returns `false`, the crate runs userspace AEAD through
+/// `libssl`; auto-install on accept/connect skips silently. Load the
+/// module with `modprobe tls` or build the kernel with `CONFIG_TLS=y`
+/// to enable kTLS.
 #[must_use]
 pub fn host_ktls_available() -> bool {
     #[cfg(target_os = "linux")]
@@ -132,9 +121,8 @@ pub(crate) fn install_ktls(ssl: &Ssl, fd: c_int) -> Result<()> {
     }
 }
 
-/// Derivation only — used by the dispatcher and by tests on non-Linux
-/// hosts that want to exercise the key-block plumbing without
-/// `setsockopt`-ing anything.
+/// Derivation only. Used by the dispatcher and by tests on non-Linux
+/// hosts to check key-block output without calling `setsockopt`.
 #[cfg(target_os = "linux")]
 fn derive_crypto_info(ssl: &Ssl, cipher: KtlsCipher) -> Result<CryptoInfo> {
     let (write_seq, read_seq) = sequences(ssl);
@@ -221,24 +209,19 @@ fn derive_crypto_info(ssl: &Ssl, cipher: KtlsCipher) -> Result<CryptoInfo> {
     }
 }
 
-/// Verify libssl has no buffered data that the kernel would miss after
-/// install (it would be silently dropped because the kernel takes over
-/// the read path).
+/// Check that libssl holds no buffered data the kernel would miss after
+/// install (install would drop it when the kernel takes the read path).
 ///
-/// Uses `SSL_has_pending`, not `SSL_pending`: the latter only counts
-/// already-*decrypted* bytes, so it returns 0 in the dangerous case
-/// where the peer's first application record was coalesced into the
-/// same TCP segment as the handshake `Finished`. `SSL_do_handshake`
-/// pulls that whole segment off the socket into libssl's BIO, leaving
-/// the trailing application record buffered but still *undecrypted* —
-/// `SSL_pending` reports 0 while the bytes are sitting in libssl, about
-/// to be stranded once the kernel owns the fd. `SSL_has_pending` also
-/// reports buffered-but-undecrypted transport data, so it catches this.
+/// Uses `SSL_has_pending`, not `SSL_pending`. `SSL_pending` counts only
+/// decrypted bytes, so it reads 0 when a first application record arrives
+/// coalesced with the handshake `Finished`: `SSL_do_handshake` pulls the
+/// whole segment into the BIO and leaves the trailing record buffered
+/// but undecrypted. `SSL_has_pending` also reports undecrypted transport
+/// data, so it catches that case.
 ///
-/// NB: this crate never enables read-ahead (`SSL_set_read_ahead` /
-/// `SSL_CTX_set_read_ahead`), so `SSL_has_pending` cannot spuriously
-/// fire on a partial undecryptable record here — a non-zero result
-/// always means real bytes the kernel would miss.
+/// Read-ahead stays off (`SSL_set_read_ahead` / `SSL_CTX_set_read_ahead`
+/// are never set), so a non-zero result means the kernel would miss
+/// real bytes.
 pub(crate) fn check_no_buffered_plaintext(ssl: &Ssl) -> Result<()> {
     // SAFETY: ssl is live.
     let has_pending = unsafe { aws_lc_sys::SSL_has_pending(ssl.as_ptr()) };
@@ -395,7 +378,7 @@ mod linux {
     }
 
     fn set_ulp_tls(fd: c_int) -> io::Result<()> {
-        // `"tls"` literal, not NUL-terminated — the kernel takes an
+        // `"tls"` literal, not NUL-terminated; the kernel takes an
         // explicit length and matches on prefix.
         let name = b"tls";
         // SAFETY: `fd` is a valid open socket fd. `name` is a 3-byte
@@ -606,9 +589,8 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn host_ktls_available_matches_proc_file() {
-        // The function is documented as a heuristic over
-        // /proc/net/tls_stat; lock that contract in so a future
-        // refactor cannot drift away silently.
+        // Locks in the documented heuristic: presence of
+        // /proc/net/tls_stat.
         let direct = std::path::Path::new("/proc/net/tls_stat").exists();
         assert_eq!(host_ktls_available(), direct);
     }

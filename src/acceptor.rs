@@ -10,7 +10,7 @@ use crate::ServerConfig;
 
 /// Acceptor that hands out [`TlsStream`]s on top of inbound TCP connections.
 ///
-/// Cheap to clone (it's just an `Arc`); one acceptor can be shared across
+/// Cheap to clone (wraps an `Arc`); one acceptor can be shared across
 /// many tasks.
 #[derive(Clone, Debug)]
 pub struct TlsAcceptor {

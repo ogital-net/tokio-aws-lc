@@ -3,10 +3,10 @@
 //!
 //! Three backends:
 //!
-//! - `tokio_aws_lc_userspace` — this crate with `disable_ktls()` on
+//! - `tokio_aws_lc_userspace` - this crate with `disable_ktls()` on
 //!   both sides, so `accept`/`connect` skip the kTLS install probe
 //!   entirely. Lower bound for our handshake cost.
-//! - `tokio_aws_lc_auto_ktls` — this crate with the default config,
+//! - `tokio_aws_lc_auto_ktls` - this crate with the default config,
 //!   so `accept`/`connect` run the kTLS auto-install path on
 //!   handshake completion. On a host with the `tls` ULP loaded this
 //!   succeeds and bumps the data path into the kernel; on a host
@@ -15,7 +15,7 @@
 //!   userspace AEAD. Comparing this row against the userspace row
 //!   measures the auto-install overhead, both in the success case
 //!   and in the fallback case.
-//! - `rustls_aws_lc_rs` — `tokio-rustls` with rustls's `aws-lc-rs`
+//! - `rustls_aws_lc_rs` - `tokio-rustls` with rustls's `aws-lc-rs`
 //!   crypto provider. Same underlying `libcrypto` as us.
 //!
 //! Each iteration:

@@ -4,11 +4,11 @@
 //! fixture so the only moving variable is the engine driving the
 //! record layer:
 //!
-//! - [`AwsLcStack`] — this crate. Two flavours: `userspace` (both
+//! - [`AwsLcStack`] - this crate. Two flavors: `userspace` (both
 //!   sides call `disable_ktls()` so reads/writes stay in `SSL_read` /
 //!   `SSL_write`) and `ktls` (default, so the engine auto-installs
 //!   kernel TLS once the handshake finishes; Linux-only).
-//! - [`RustlsStack`] — `tokio-rustls` with the `aws-lc-rs` crypto
+//! - [`RustlsStack`] - `tokio-rustls` with the `aws-lc-rs` crypto
 //!   provider. Same `libcrypto` primitives as us (both ultimately
 //!   route through `aws-lc-sys`); the comparison isolates "rustls
 //!   record-layer + state machine" overhead from "raw `libssl`
@@ -68,12 +68,12 @@ impl AwsLcStack {
     /// `userspace = true` calls `disable_ktls()` on both sides so the
     /// data path stays in `SSL_read` / `SSL_write` after the
     /// handshake. With `false`, the engine auto-installs kTLS
-    /// immediately after the handshake completes (Linux only — on
+    /// immediately after the handshake completes (Linux only; on
     /// other targets the auto-install is a no-op and the data path
     /// remains userspace regardless).
     pub fn new(userspace: bool) -> Self {
         // AWS-LC's default key-exchange group list leads with the
-        // hybrid post-quantum `X25519MLKEM768`, which is ~65µs slower
+        // hybrid post-quantum `X25519MLKEM768`, which is ~65us slower
         // per handshake than classical X25519. `tokio-rustls` with
         // the `aws-lc-rs` provider at 0.23 / 0.26 offers the classical
         // groups only by default. We pin both stacks to the same
@@ -154,7 +154,7 @@ impl RustlsStack {
 
 /// Skip path validation but keep the TLS-level signature check. This
 /// matches what our [`tokio_aws_lc::ClientConfigBuilder::dangerous_disable_verification`]
-/// switch does on the AWS-LC side (which sets `SSL_VERIFY_NONE` — the
+/// switch does on the AWS-LC side (which sets `SSL_VERIFY_NONE`; the
 /// per-handshake `CertificateVerify` check still runs).
 #[derive(Debug)]
 struct AcceptAnyServerCert {

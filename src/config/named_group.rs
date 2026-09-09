@@ -1,17 +1,11 @@
-//! Named-group (key-exchange) selection for both server and client.
+//! Named-group (key-exchange) selection for server and client.
 //!
-//! TLS 1.3 calls them "supported groups" (RFC 8446 §4.2.7); TLS 1.2
-//! calls the same registry "named curves" (RFC 8422). AWS-LC's
-//! [`SSL_CTX_set1_groups`] takes an array of NIDs and consults the
-//! result during ECDHE / hybrid PQ negotiation.
+//! TLS 1.3 calls them "supported groups" (RFC 8446 Sec 4.2.7); TLS 1.2
+//! calls the same registry "named curves" (RFC 8422). AWS-LC reads
+//! the NID list during ECDHE and hybrid PQ negotiation.
 //!
-//! The default group list AWS-LC ships includes the hybrid
-//! post-quantum group `X25519MLKEM768`, which is significantly more
-//! expensive than classical X25519. That's the right default for
-//! production — it provides forward secrecy against a future
-//! quantum-capable adversary recording today's handshake — but if you
-//! need to opt out for latency or interoperability reasons, configure
-//! an explicit group list via
+//! AWS-LC defaults to `X25519MLKEM768` first. It costs more than
+//! X25519. Set an explicit group list to opt out via
 //! [`crate::ServerConfigBuilder::named_groups`] /
 //! [`crate::ClientConfigBuilder::named_groups`].
 //!
@@ -32,9 +26,8 @@ use crate::ffi::SslCtx;
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NamedGroup {
-    /// X25519 elliptic-curve Diffie–Hellman (RFC 7748). Classical
-    /// curve, fastest of the lot, and the universal default across
-    /// modern TLS implementations.
+    /// X25519 elliptic-curve Diffie-Hellman (RFC 7748). Fast
+    /// default across modern TLS stacks.
     X25519,
     /// NIST P-256 / secp256r1.
     Secp256r1,

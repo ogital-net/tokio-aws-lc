@@ -7,11 +7,11 @@ use crate::error::{last_error, Error, Result};
 use crate::ffi::Ssl;
 use crate::ktls::cipher::KtlsCipher;
 
-/// Whether the current TLS session can be offloaded to the Linux
-/// `tls` ULP (kernel TLS). Returned by [`crate::TlsStream::ktls_eligibility`].
+/// Whether the current TLS session can offload to Linux kernel TLS.
+/// Returned by [`crate::TlsStream::ktls_eligibility`].
 ///
-/// All fields are diagnostic only — the kTLS dispatch under the hood
-/// uses the integer cipher-suite ID, not these strings.
+/// Fields are diagnostic only; the kTLS path uses the integer
+/// cipher-suite ID, not these strings.
 #[derive(Debug, Clone)]
 pub struct KtlsEligibility {
     tls_version: String,
@@ -35,9 +35,8 @@ impl KtlsEligibility {
         &self.cipher
     }
 
-    /// `true` if the (version, cipher) tuple is one the kernel `tls`
-    /// ULP can offload. Does not check the host kernel — eligibility
-    /// here is a structural property of the negotiation only.
+    /// `true` if the kernel `tls` ULP supports the (version, cipher) pair.
+    /// Skips the host kernel check; this reflects the negotiation only.
     #[must_use]
     pub fn is_compatible(&self) -> bool {
         self.compatible

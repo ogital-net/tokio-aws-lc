@@ -4,14 +4,14 @@
 //!
 //! Backends:
 //!
-//! - `tokio_aws_lc/userspace` — both sides `disable_ktls()`. Data
-//!   path: `SSL_write` → `BIO_write` → `send(2)`.
-//! - `tokio_aws_lc/ktls` — auto-install on Linux after the
+//! - `tokio_aws_lc/userspace` - both sides `disable_ktls()`. Data
+//!   path: `SSL_write` -> `BIO_write` -> `send(2)`.
+//! - `tokio_aws_lc/ktls` - auto-install on Linux after the
 //!   handshake. Data path: `write(2)` on the `tls` ULP'd socket;
 //!   AEAD happens in the kernel. On non-Linux this falls through to
 //!   the userspace path (auto-install silently no-ops), so the row is
 //!   skipped to keep the comparison honest.
-//! - `rustls_aws_lc_rs` — `tokio-rustls` with rustls's `aws-lc-rs`
+//! - `rustls_aws_lc_rs` - `tokio-rustls` with rustls's `aws-lc-rs`
 //!   crypto provider.
 //!
 //! Payload size: 1 MiB per iteration. Reported as MiB/s via
@@ -90,12 +90,11 @@ fn bench_throughput(c: &mut Criterion) {
                             .connect("localhost", tcp)
                             .await
                             .expect("client handshake");
-                        // If the auto-install silently fell back to
-                        // userspace (host kernel without the `tls`
-                        // module, etc.) we still time it — the bench
-                        // will then read as equal to the userspace
-                        // row, which is the truthful answer for this
-                        // host.
+                        // If the auto-install fell back to userspace
+                        // (host kernel without the `tls` module, etc.)
+                        // the timing still runs; the bench then reads
+                        // equal to the userspace row, the correct
+                        // answer for this host.
                         let start = Instant::now();
                         stream.write_all(&payload).await.expect("write_all");
                         stream.shutdown().await.ok();

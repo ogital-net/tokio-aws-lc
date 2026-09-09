@@ -32,10 +32,9 @@ pub struct ServerConfig {
     // the CTX that holds the raw pointer.
 }
 
-// SAFETY: ServerConfig is logically immutable after construction. The
-// underlying SSL_CTX is documented to be safe for concurrent read use
-// (which is all we do — handshakes mutate per-connection SSL state, not
-// the CTX). Any ALPN buffer is read-only ex_data on the CTX.
+// SAFETY: ServerConfig is immutable after construction. The SSL_CTX
+// supports concurrent read use (handshakes mutate per-connection SSL
+// state, not the CTX). The ALPN buffer is read-only CTX ex_data.
 unsafe impl Send for ServerConfig {}
 unsafe impl Sync for ServerConfig {}
 
@@ -46,8 +45,8 @@ impl ServerConfig {
         ServerConfigBuilder::default()
     }
 
-    /// Raw access to the underlying `SSL_CTX` pointer. Used by
-    /// [`crate::TlsAcceptor`] when minting per-connection `SSL` handles.
+    /// Raw access to the `SSL_CTX` pointer. Used by [`crate::TlsAcceptor`]
+    /// to create per-connection `SSL` handles.
     pub(crate) fn ctx_ptr(&self) -> *mut aws_lc_sys::SSL_CTX {
         self.ctx.as_ptr()
     }
@@ -143,7 +142,7 @@ impl ServerConfigBuilder {
     /// as an allowlist for both versions; a version with no listed suites
     /// is disabled, subject to the configured protocol-version bounds.
     ///
-    /// Overrides [`Self::ktls_aead_only`] when both are set — the
+    /// Overrides [`Self::ktls_aead_only`] when both are set; the
     /// user-supplied list wins.
     ///
     /// An empty slice clears any cipher-suite override and falls back
@@ -291,7 +290,7 @@ impl ServerConfigBuilder {
             }
         }
 
-        // Disable session tickets unconditionally — see module docs.
+        // Disable session tickets; see module docs.
         // SAFETY: ctx is live; the options/value are scalar constants.
         #[allow(clippy::cast_sign_loss)]
         unsafe {
@@ -403,7 +402,7 @@ fn path_to_cstring(p: &Path) -> Result<CString> {
 fn load_cert_chain_pem(ctx: &SslCtx, pem: &[u8]) -> Result<()> {
     // SAFETY: BIO_new_mem_buf takes a const-buffer + length and produces a
     // read-only BIO; the BIO does not take ownership of `pem`, so the
-    // slice can outlive the BIO (and does — it's a borrow from the caller).
+    // slice can outlive the BIO; it is a borrow from the caller.
     #[allow(clippy::cast_possible_wrap)]
     let bio = unsafe { aws_lc_sys::BIO_new_mem_buf(pem.as_ptr().cast(), pem.len() as isize) };
     if bio.is_null() {
@@ -568,14 +567,14 @@ fn load_private_key_der(ctx: &SslCtx, der: &[u8]) -> Result<()> {
     Ok(())
 }
 
-// Local guard so a fallible loader doesn't leak the BIO; not promoted
-// to the public ffi.rs surface because the wider crate hands BIOs off
-// via Bio::into_raw (different ownership pattern).
+// Local guard against BIO leaks from a fallible loader. Kept out of the
+// public ffi.rs surface since Bio::into_raw follows a different
+// ownership pattern.
 struct BioGuard(*mut aws_lc_sys::BIO);
 impl Drop for BioGuard {
     fn drop(&mut self) {
-        // SAFETY: `self.0` was obtained from BIO_new_* and was not handed
-        // off; we own the free.
+        // SAFETY: `self.0` comes from BIO_new_* and was never handed
+        // off; this owns the free.
         unsafe {
             aws_lc_sys::BIO_free(self.0);
         }
@@ -701,12 +700,10 @@ unsafe extern "C" fn alpn_ex_free(
 /// [`SSL_get_SSL_CTX`](aws_lc_sys::SSL_get_SSL_CTX) rather than relying on the
 /// user `arg`.
 ///
-/// Returns the first server-preference protocol that the client also
-/// offers. If no overlap exists, returns `SSL_TLSEXT_ERR_ALERT_FATAL`
-/// so the handshake fails with `no_application_protocol` (RFC 7301
-/// §3.2) rather than silently completing without ALPN — the latter
-/// invites protocol-confusion on a server that was explicitly
-/// configured with an ALPN list.
+/// Returns the first server-preference protocol the client also offers.
+/// With no overlap, returns `SSL_TLSEXT_ERR_ALERT_FATAL` so the handshake
+/// fails with `no_application_protocol` (RFC 7301 Sec 3.2) instead of
+/// completing without ALPN on a server configured with an ALPN list.
 unsafe extern "C" fn alpn_select_cb(
     ssl: *mut aws_lc_sys::SSL,
     out: *mut *const u8,
@@ -808,9 +805,7 @@ mod tests {
 
     #[test]
     fn mismatched_cert_and_key_rejected() {
-        // Truncate the key so PEM parsing fails before mismatch check
-        // — covers the "bad input rejected" property even though it
-        // doesn't exercise SSL_CTX_check_private_key specifically.
+        // Feed a bad key so PEM parsing fails and the builder rejects it.
         let err = ServerConfig::builder()
             .with_pem_bytes(TEST_CERT_PEM, b"not a real key")
             .expect_err("should fail on garbage key");

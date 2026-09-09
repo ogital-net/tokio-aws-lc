@@ -105,9 +105,9 @@ async fn ktls_install_and_round_trip() {
         let mut buf = [0u8; 64];
         let n = stream.read(&mut buf).await.expect("server read");
         assert_eq!(&buf[..n], b"hello from kernel-tls client");
-        // Don't call SSL_shutdown after kTLS install — the kernel TX
-        // path would corrupt the alert. The kTLS-aware poll_shutdown
-        // does the right thing (shutdown(SHUT_WR)).
+        // Skip SSL_shutdown after kTLS install; the kernel TX path would
+        // corrupt the alert. The kTLS-aware poll_shutdown takes the right
+        // path (shutdown(SHUT_WR)).
         stream.shutdown().await.ok();
         Ok(())
     });
@@ -329,7 +329,7 @@ async fn ktls_install_and_round_trip_tls12() {
 
 /// Build a server+client pair pinned to a single TLS 1.3 cipher, run
 /// `install_ktls()` on both sides, and round-trip one message each way.
-/// Used to exercise the AES-256 and `ChaCha20` arms in
+/// Exercises the AES-256 and `ChaCha20` arms in
 /// `src/ktls/mod.rs::derive_crypto_info`.
 async fn run_tls13_ktls_round_trip(
     suite: &'static tokio_aws_lc::CipherSuite,

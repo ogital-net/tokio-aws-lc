@@ -13,7 +13,7 @@ use crate::ClientConfig;
 /// Connector that drives outbound TLS handshakes on top of an
 /// already-connected TCP stream.
 ///
-/// Cheap to clone (it's just an `Arc`); one connector can fan out across
+/// Cheap to clone (wraps an `Arc`); one connector can fan out across
 /// many tasks.
 #[derive(Clone, Debug)]
 pub struct TlsConnector {
@@ -34,11 +34,11 @@ impl TlsConnector {
     ///
     /// `server_name` is the peer identity to authenticate. It may be:
     ///
-    /// - a DNS name (e.g. `"example.com"`) — sent as the SNI extension
-    ///   and matched against the certificate's DNS SANs / CN; or
-    /// - an IP-address literal (e.g. `"10.0.0.5"` or `"2001:db8::1"`)
-    ///   — *not* sent as SNI (RFC 6066 §3 forbids IPs in SNI) and
-    ///   matched against the certificate's iPAddress SANs.
+    /// - a DNS name (e.g. `"example.com"`): sent as SNI and matched
+    ///   against the certificate DNS SANs / CN; or
+    /// - an IP-address literal (e.g. `"10.0.0.5"`, `"2001:db8::1"`):
+    ///   not sent as SNI (RFC 6066 Sec 3 keeps IPs out of SNI) and
+    ///   matched against the certificate IP SANs.
     ///
     /// Both checks happen inside libssl as part of the handshake; a
     /// mismatch fails the handshake with a verification error. Disabling
@@ -63,9 +63,9 @@ impl TlsConnector {
         let name_c = CString::new(server_name)
             .map_err(|_| Error::Init("server_name contains an embedded NUL byte".into()))?;
 
-        // RFC 6066 §3: the SNI extension carries DNS names only, never
-        // IP literals. Route IP-literal peers through the iPAddress SAN
-        // path; everything else gets SNI + DNS-SAN/CN matching.
+        // RFC 6066 Sec 3: SNI carries DNS names only. Route IP literals
+        // through IP SAN checks; all other names use SNI plus
+        // DNS-SAN/CN checks.
         match server_name.parse::<IpAddr>() {
             Ok(_) => {
                 // SAFETY: ssl is fresh; SSL_get0_param returns a

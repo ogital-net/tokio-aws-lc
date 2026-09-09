@@ -179,9 +179,9 @@ fn record_accepted(result: io::Result<usize>, bytes: &[u8], expected: &mut Vec<u
 }
 
 /// The peer must stay alive and unpolled throughout this helper. Its return
-/// proves that a previously acknowledged write still needs flushing, whereas the
-/// latest new write (including an equal-data, different-address retry) has
-/// accepted nothing. Only Ready(Ok(n)) contributes to the expected stream.
+/// shows that an acknowledged write still needs flushing, while the latest
+/// new write (including an equal-data, different-address retry) accepts
+/// nothing. Only Ready(Ok(n)) contributes to the expected stream.
 async fn stall_writer(stream: &mut TlsStream) -> Vec<u8> {
     let mut expected = Vec::new();
     for sequence in 1..=1024 {
