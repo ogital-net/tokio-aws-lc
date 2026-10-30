@@ -85,9 +85,14 @@ jobs:
       # The `hyper` feature transitively pulls dependencies that track a
       # newer rustc; consumers enabling it must follow hyper's MSRV.
       #
-      # Pin transitive deps whose latest release exceeds our MSRV.
+      # Check our MSRV with compatible dependencies, not necessarily latest.
+      # Tokio 1.54.1 requires rustc 1.85; 1.53.1 supports 1.82.
+      - run: cargo update -p tokio --precise 1.53.1
       # jobserver 0.1.35 requires rustc 1.85; 0.1.34 supports 1.82.
       - run: cargo update jobserver@0.1.35 --precise 0.1.34
+      # Cargo 1.82 can resolve bindgen with syn 2 but prettyplease 0.3
+      # with syn 3. Keep their AST types compatible.
+      - run: cargo update -p prettyplease --precise 0.2.37
       - run: cargo check
 
   deny:

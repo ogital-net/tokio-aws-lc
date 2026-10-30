@@ -278,9 +278,13 @@ kernel rejects the per-direction crypto-info upload.
 
 ## MSRV
 
-Rust 1.82 for the default build. The `hyper` feature transitively
-pulls dependencies that track a newer rustc; consumers enabling it
-must follow `hyper`'s MSRV.
+Rust 1.82 for the default build with compatible dependency versions.
+Newer dependency releases may require a newer compiler; consumers using
+Rust 1.82 may need to pin compatible versions in their lockfile. The MSRV
+CI job checks this crate with a compatible dependency set, while stable
+CI checks current dependencies. The `hyper` feature transitively pulls
+dependencies that track a newer rustc; consumers enabling it must follow
+`hyper`'s MSRV.
 
 ## License
 
