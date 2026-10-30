@@ -135,7 +135,7 @@ mod tests {
         // Length prefix says 5, only 2 bytes follow.
         let bad = b"\x05ab";
         let decoded: Vec<&[u8]> = iter_alpn_wire(bad).collect();
-        assert!(decoded.is_empty());
+        assert_eq!(decoded, [] as [&[u8]; 0]);
     }
 
     #[test]

@@ -385,7 +385,7 @@ mod tests {
                 s.version(),
                 ProtocolVersion::Tls12 | ProtocolVersion::Tls13
             ));
-            assert!(!s.name().is_empty());
+            assert_ne!(s.name(), "");
         }
     }
 }

@@ -212,7 +212,7 @@ async fn stall_writer(stream: &mut TlsStream) -> Vec<u8> {
                     }
                     Poll::Pending => match flush_once(stream).await {
                         Poll::Pending => {
-                            assert!(!expected.is_empty());
+                            assert_ne!(expected, [] as [u8; 0]);
                             moved.fill(0xbb);
                             return expected;
                         }
@@ -456,7 +456,7 @@ async fn bare_drop(version: ProtocolVersion, offload: Offload, drop_client: bool
         let mut tail = Vec::new();
         let error = receiver.read_to_end(&mut tail).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
-        assert!(tail.is_empty());
+        assert_eq!(tail, [] as [u8; 0]);
         for _ in 0..3 {
             let error = receiver.read(&mut [0; 1]).await.unwrap_err();
             assert_eq!(
