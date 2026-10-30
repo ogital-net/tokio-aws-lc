@@ -116,6 +116,41 @@ impl Control {
     }
 }
 
+/// Older kernels can report application data once for queued plaintext and
+/// again for a newly decrypted record in the same recvmsg.
+#[repr(transparent)]
+struct RecvControl([Control; 2]);
+
+impl RecvControl {
+    fn new() -> Self {
+        Self([Control::new(), Control::new()])
+    }
+
+    fn message(&mut self, iov: &mut libc::iovec) -> libc::msghdr {
+        let mut msg = self.0[0].message(iov);
+        msg.msg_control = self.0.as_mut_ptr().cast();
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            msg.msg_controllen = size_of::<Self>() as _;
+        }
+        msg
+    }
+
+    fn record_type(&self, len: usize, flags: libc::c_int) -> io::Result<Option<u8>> {
+        let first = self.0[0].record_type(len.min(CONTROL_SPACE), flags)?;
+        if len <= CONTROL_SPACE {
+            return Ok(first);
+        }
+        let second = self.0[1].record_type(len - CONTROL_SPACE, flags)?;
+        if first != Some(APPLICATION_DATA) || second != first {
+            return Err(invalid_data(
+                "conflicting or unsupported duplicate kTLS record-type messages",
+            ));
+        }
+        Ok(first)
+    }
+}
+
 struct Received {
     len: usize,
     record_type: Option<u8>,
@@ -123,7 +158,7 @@ struct Received {
 }
 
 fn recv_record(tcp: &TcpStream, dst: &mut [u8]) -> io::Result<Received> {
-    let mut control = Control::new();
+    let mut control = RecvControl::new();
     let mut iov = libc::iovec {
         iov_base: dst.as_mut_ptr().cast(),
         iov_len: dst.len(),
@@ -140,15 +175,55 @@ fn recv_record(tcp: &TcpStream, dst: &mut [u8]) -> io::Result<Received> {
     let len = n as usize;
     // msg_controllen differs between Linux libc ABIs.
     #[allow(clippy::unnecessary_cast)]
-    let record_type = control.record_type(msg.msg_controllen as usize, msg.msg_flags)?;
+    let record_type = control
+        .record_type(msg.msg_controllen as usize, msg.msg_flags)
+        .map_err(|error| recv_error(&error, &msg, &control, len, dst.len()))?;
     if len > dst.len() {
-        return Err(invalid_data("kTLS recvmsg exceeded its destination buffer"));
+        return Err(recv_error(
+            &invalid_data("kTLS recvmsg exceeded its destination buffer"),
+            &msg,
+            &control,
+            len,
+            dst.len(),
+        ));
     }
     Ok(Received {
         len,
         record_type,
         flags: msg.msg_flags,
     })
+}
+
+#[allow(clippy::unnecessary_cast)]
+fn recv_error(
+    error: &io::Error,
+    msg: &libc::msghdr,
+    control: &RecvControl,
+    received: usize,
+    capacity: usize,
+) -> io::Error {
+    let first = &control.0[0];
+    let first_record_type = first
+        .record_type((msg.msg_controllen as usize).min(CONTROL_SPACE), 0)
+        .ok()
+        .flatten();
+    io::Error::new(
+        error.kind(),
+        format!(
+            "{error} (recvmsg: msg_flags={:#x}, MSG_CTRUNC={}, MSG_TRUNC={}, MSG_EOR={}, \
+             received={received}, capacity={capacity}, msg_controllen={}, control_capacity={}, \
+             cmsg_len={}, cmsg_level={}, cmsg_type={}, first_record_type={first_record_type:?})",
+            msg.msg_flags,
+            msg.msg_flags & libc::MSG_CTRUNC != 0,
+            msg.msg_flags & libc::MSG_TRUNC != 0,
+            msg.msg_flags & libc::MSG_EOR != 0,
+            msg.msg_controllen,
+            size_of::<RecvControl>(),
+            first.header.cmsg_len,
+            first.header.cmsg_level,
+            first.header.cmsg_type,
+        ),
+    )
 }
 
 enum Terminal {
@@ -446,6 +521,104 @@ mod tests {
     }
 
     #[test]
+    fn receive_ancillary_storage_holds_two_aligned_messages() {
+        let mut control = RecvControl([rx_control(APPLICATION_DATA), rx_control(APPLICATION_DATA)]);
+        let mut bytes = [0u8; 1];
+        let mut iov = libc::iovec {
+            iov_base: bytes.as_mut_ptr().cast(),
+            iov_len: bytes.len(),
+        };
+        let msg = control.message(&mut iov);
+        assert_eq!(msg.msg_controllen as usize, 2 * CONTROL_SPACE);
+        assert_eq!(size_of::<RecvControl>(), 2 * CONTROL_SPACE);
+        // SAFETY: Both headers describe initialized, aligned one-byte messages
+        // within the live control array, and msg covers exactly that array.
+        unsafe {
+            let first = libc::CMSG_FIRSTHDR(&raw const msg);
+            assert_eq!(first, &raw mut control.0[0].header);
+            let second = libc::CMSG_NXTHDR(&raw const msg, first);
+            assert_eq!(second, &raw mut control.0[1].header);
+            assert_eq!(*libc::CMSG_DATA(first), APPLICATION_DATA);
+            assert_eq!(*libc::CMSG_DATA(second), APPLICATION_DATA);
+            assert!(libc::CMSG_NXTHDR(&raw const msg, second).is_null());
+        }
+    }
+
+    #[test]
+    fn receive_ancillary_accepts_missing_single_and_duplicate_application_types() {
+        assert_eq!(RecvControl::new().record_type(0, 0).unwrap(), None);
+        for kind in [ALERT, HANDSHAKE, APPLICATION_DATA, 255] {
+            let control = RecvControl([rx_control(kind), Control::new()]);
+            for len in CONTROL_LEN..=CONTROL_SPACE {
+                assert_eq!(control.record_type(len, 0).unwrap(), Some(kind));
+            }
+        }
+        let control = RecvControl([rx_control(APPLICATION_DATA), rx_control(APPLICATION_DATA)]);
+        for len in CONTROL_SPACE + CONTROL_LEN..=2 * CONTROL_SPACE {
+            for flags in [0, libc::MSG_EOR] {
+                let kind = control.record_type(len, flags).unwrap();
+                let mut reader = RecordReader::default();
+                assert_eq!(
+                    reader.consume(kind, flags, b"upload").unwrap(),
+                    ReadOutcome::Data(6)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn receive_ancillary_rejects_conflicting_or_duplicate_control_types() {
+        for first in [ALERT, HANDSHAKE, APPLICATION_DATA, 255] {
+            for second in [ALERT, HANDSHAKE, APPLICATION_DATA, 255] {
+                if first == APPLICATION_DATA && second == APPLICATION_DATA {
+                    continue;
+                }
+                let control = RecvControl([rx_control(first), rx_control(second)]);
+                let error = control.record_type(2 * CONTROL_SPACE, 0).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                let mut reader = RecordReader::default();
+                let first = reader.fail(error);
+                assert_sticky_error(&mut reader, &first);
+            }
+        }
+    }
+
+    #[test]
+    fn receive_ancillary_rejects_incomplete_malformed_or_truncated_messages() {
+        let mut control = RecvControl([rx_control(APPLICATION_DATA), rx_control(APPLICATION_DATA)]);
+        for len in (1..CONTROL_LEN)
+            .chain(CONTROL_SPACE + 1..CONTROL_SPACE + CONTROL_LEN)
+            .chain([2 * CONTROL_SPACE + 1, usize::MAX])
+        {
+            assert!(control.record_type(len, 0).is_err());
+        }
+        for flags in [libc::MSG_CTRUNC, libc::MSG_TRUNC] {
+            for len in [0, CONTROL_SPACE, 2 * CONTROL_SPACE] {
+                let error = control.record_type(len, flags).unwrap_err();
+                let mut reader = RecordReader::default();
+                let first = reader.fail(error);
+                assert_sticky_error(&mut reader, &first);
+            }
+        }
+        for index in 0..2 {
+            for len in [0, CONTROL_LEN - 1, CONTROL_LEN + 1, usize::MAX] {
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    control.0[index].header.cmsg_len = len as _;
+                }
+                assert!(control.record_type(2 * CONTROL_SPACE, 0).is_err());
+            }
+            control.0[index] = rx_control(APPLICATION_DATA);
+            control.0[index].header.cmsg_level = libc::SOL_SOCKET;
+            assert!(control.record_type(2 * CONTROL_SPACE, 0).is_err());
+            control.0[index] = rx_control(APPLICATION_DATA);
+            control.0[index].header.cmsg_type = TLS_SET_RECORD_TYPE;
+            assert!(control.record_type(2 * CONTROL_SPACE, 0).is_err());
+            control.0[index] = rx_control(APPLICATION_DATA);
+        }
+    }
+
+    #[test]
     fn ancillary_rejects_malformed_lengths_and_unrelated_headers() {
         let mut control = rx_control(ALERT);
         for len in (1..CONTROL_LEN).chain([CONTROL_SPACE + 1, usize::MAX]) {
@@ -480,6 +653,56 @@ mod tests {
                 .consume(Some(ALERT), flags | libc::MSG_EOR, &CLOSE_NOTIFY)
                 .unwrap_err();
             assert_sticky_error(&mut reader, &first);
+        }
+    }
+
+    #[test]
+    fn receive_errors_include_flags_lengths_and_record_metadata() {
+        for flags in [
+            libc::MSG_CTRUNC,
+            libc::MSG_TRUNC,
+            libc::MSG_CTRUNC | libc::MSG_TRUNC | libc::MSG_EOR,
+        ] {
+            for control_len in [0, CONTROL_SPACE] {
+                let mut control = RecvControl([rx_control(APPLICATION_DATA), Control::new()]);
+                let mut bytes = [0u8; 8];
+                let mut iov = libc::iovec {
+                    iov_base: bytes.as_mut_ptr().cast(),
+                    iov_len: bytes.len(),
+                };
+                let mut msg = control.message(&mut iov);
+                msg.msg_flags = flags;
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    msg.msg_controllen = control_len as _;
+                }
+                let error = control.record_type(control_len, flags).unwrap_err();
+                let error = recv_error(&error, &msg, &control, 3, bytes.len());
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                let message = error.to_string();
+                assert!(message.starts_with("truncated kTLS recvmsg payload or ancillary data"));
+                for field in [
+                    format!("msg_flags={flags:#x}"),
+                    format!("MSG_CTRUNC={}", flags & libc::MSG_CTRUNC != 0),
+                    format!("MSG_TRUNC={}", flags & libc::MSG_TRUNC != 0),
+                    format!("MSG_EOR={}", flags & libc::MSG_EOR != 0),
+                    "received=3, capacity=8".to_owned(),
+                    format!("msg_controllen={control_len}"),
+                    format!("control_capacity={}", size_of::<RecvControl>()),
+                    format!("cmsg_len={CONTROL_LEN}"),
+                    format!("cmsg_level={}", libc::SOL_TLS),
+                    format!("cmsg_type={TLS_GET_RECORD_TYPE}"),
+                    format!(
+                        "first_record_type={:?}",
+                        (control_len != 0).then_some(APPLICATION_DATA)
+                    ),
+                ] {
+                    assert!(message.contains(&field), "missing {field}: {message}");
+                }
+                let mut reader = RecordReader::default();
+                let first = reader.fail(error);
+                assert_sticky_error(&mut reader, &first);
+            }
         }
     }
 

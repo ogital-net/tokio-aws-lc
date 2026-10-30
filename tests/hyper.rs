@@ -131,6 +131,87 @@ async fn hyper_roundtrip_http2() {
     assert_eq!(body, BODY);
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hyper_http2_upload_with_ktls() {
+    use tokio_aws_lc::cipher_suite::TLS13_AES_256_GCM_SHA384;
+    use tokio_aws_lc::{host_ktls_available, ProtocolVersion};
+
+    if !host_ktls_available() {
+        assert_ne!(
+            std::env::var("TOKIO_AWS_LC_REQUIRE_KTLS").as_deref(),
+            Ok("1"),
+            "TOKIO_AWS_LC_REQUIRE_KTLS=1 forbids skipping: host kTLS is unavailable"
+        );
+        eprintln!("SKIP HTTP/2 upload: host kTLS is unavailable");
+        return;
+    }
+
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let server_config = ServerConfig::builder()
+            .alpn_protocols(&[b"h2"])
+            .min_protocol_version(ProtocolVersion::Tls13)
+            .max_protocol_version(ProtocolVersion::Tls13)
+            .cipher_suites(&[TLS13_AES_256_GCM_SHA384])
+            .with_pem_bytes(CERT_PEM, KEY_PEM)
+            .unwrap();
+        let client_config = ClientConfig::builder()
+            .with_root_certs_pem_bytes(CERT_PEM)
+            .alpn_protocols(&[b"h2"])
+            .disable_ktls()
+            .build()
+            .unwrap();
+        let acceptor = TlsAcceptor::new(Arc::new(server_config));
+        let connector = HttpsConnector::new(TlsConnector::new(Arc::new(client_config)));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let stream = acceptor.accept(tcp).await.expect("TLS accept");
+            assert!(stream.ktls_active(), "upload must exercise server kTLS");
+            assert_eq!(stream.negotiated().version(), "TLSv1.3");
+            let upload = service_fn(|request: Request<Incoming>| async move {
+                assert_eq!(request.version(), Version::HTTP_2);
+                let body = request.into_body().collect().await?.to_bytes();
+                Ok::<_, hyper::Error>(Response::new(Full::new(body)))
+            });
+            auto::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(stream), upload)
+                .await
+                .expect("HTTP/2 upload server");
+        });
+
+        let client: Client<HttpsConnector, Full<Bytes>> = Client::builder(TokioExecutor::new())
+            .http2_only(true)
+            .build(connector);
+        let payload = Bytes::from(
+            (0u8..=250)
+                .cycle()
+                .take(2 * 1024 * 1024 + 517)
+                .collect::<Vec<_>>(),
+        );
+        let request = Request::post(format!("https://localhost:{port}/upload"))
+            .body(Full::new(payload.clone()))
+            .unwrap();
+        let response = client.request(request).await.expect("HTTP/2 upload");
+        assert_eq!(response.version(), Version::HTTP_2);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            payload
+        );
+        drop(client);
+        tasks
+            .join_next()
+            .await
+            .unwrap()
+            .expect("upload server task");
+    })
+    .await
+    .expect("HTTP/2 upload exceeded its 15-second deadline");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hyper_roundtrip_http2_via_alpn() {
     // Leave the client in automatic mode: Connection::connected() must
