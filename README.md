@@ -60,7 +60,7 @@ builder API hides the FFI but not the semantics.
 
 ## Status
 
-Pre-release (`0.3.0`).
+Pre-release (`0.4.0`).
 
 | Surface | State |
 | --- | --- |
@@ -69,7 +69,7 @@ Pre-release (`0.3.0`).
 | Linux kTLS (`TLS_TX` + `TLS_RX`) | TLS 1.3 (AES-128/256-GCM, ChaCha20-Poly1305) and TLS 1.2 AEAD; integration-tested via `/proc/net/tls_stat`. |
 | Optional `hyper` integration | Server acceptor + `tower::Service<Uri>` client connector for `hyper` 1.x. |
 
-Not in `0.3`: session resumption, `UnixStream`, BIO-pair fallback for
+Not in `0.4`: session resumption, `UnixStream`, BIO-pair fallback for
 arbitrary IO, post-attach handshake controls (including TLS 1.3
 `NewSessionTicket` and `KeyUpdate`), `tracing` instrumentation, Windows.
 
@@ -77,15 +77,19 @@ arbitrary IO, post-attach handshake controls (including TLS 1.3
 
 ```toml
 [dependencies]
-tokio-aws-lc = "0.3"
+tokio-aws-lc = "0.4"
 ```
 
 The default build's direct runtime dependencies are `aws-lc-sys`,
 `tokio`, and, on Linux only, `libc`. The `hyper` adapters are opt-in:
 
 ```toml
-tokio-aws-lc = { version = "0.3", features = ["hyper"] }
+tokio-aws-lc = { version = "0.4", features = ["hyper"] }
 ```
+
+Use `hyper-server` or `hyper-client` instead to enable just one adapter.
+The server-only runtime dependency set does not enable `hyper-util`'s
+client support or pull in `tower-service`.
 
 Build prerequisites are whatever `aws-lc-sys` itself needs: `cmake`,
 `clang`, `libclang-dev`, `perl`, plus a working C toolchain.
@@ -251,7 +255,7 @@ cargo run --example echo-server -- 127.0.0.1:8443 \
 cargo run --example https-get -- example.com 443
 
 # Hyper 1.x server with HTTP/1.1 + HTTP/2 ALPN
-cargo run --example hyper-server --features hyper -- \
+cargo run --example hyper-server --features hyper-server -- \
     127.0.0.1:8443 tests/data/cert.pem tests/data/key.pem
 ```
 
@@ -259,7 +263,9 @@ cargo run --example hyper-server --features hyper -- \
 
 | Feature | Default | Description |
 | --- | --- | --- |
-| `hyper` | off | Server acceptor adapter and client `tower::Service<Uri>` connector for `hyper` 1.x via `hyper-util`. |
+| `hyper` | off | Enables both `hyper-client` and `hyper-server` for backward compatibility. |
+| `hyper-client` | off | `hyper::HttpsConnector`: client `tower_service::Service<Uri>` connector via `hyper-util/client-legacy`. |
+| `hyper-server` | off | `hyper::HyperAcceptor`: server acceptor adapter via `hyper-util`'s `TokioIo`, without client dependencies. |
 
 There is no parallel adapter for legacy `hyper` 0.14.
 
@@ -269,6 +275,8 @@ There is no parallel adapter for legacy `hyper` 0.14.
 cargo test                   # default features
 cargo test --features hyper  # plus hyper integration tests
 cargo test --no-default-features
+cargo test --no-default-features --features hyper-client
+cargo test --no-default-features --features hyper-server
 ```
 
 The `server_roundtrip` integration test shells out to `openssl
@@ -282,7 +290,7 @@ Rust 1.82 for the default build with compatible dependency versions.
 Newer dependency releases may require a newer compiler; consumers using
 Rust 1.82 may need to pin compatible versions in their lockfile. The MSRV
 CI job checks this crate with a compatible dependency set, while stable
-CI checks current dependencies. The `hyper` feature transitively pulls
+CI checks current dependencies. The Hyper features transitively pull
 dependencies that track a newer rustc; consumers enabling it must follow
 `hyper`'s MSRV.
 

@@ -8,7 +8,7 @@
 //! - Linux-only: kTLS install on a hyper-served `TlsStream` still serves
 //!   plaintext HTTP correctly.
 
-#![cfg(feature = "hyper")]
+#![cfg(all(feature = "hyper-client", feature = "hyper-server"))]
 
 use std::convert::Infallible;
 use std::sync::Arc;

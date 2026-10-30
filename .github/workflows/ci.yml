@@ -74,6 +74,27 @@ jobs:
       # after publish.
       - run: cargo doc --no-deps --all-features
 
+  test-hyper-features:
+    name: test (${{ matrix.feature }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        feature: [hyper-client, hyper-server]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Check without dev-dependency feature unification first.
+      - run: cargo check --lib --no-default-features --features ${{ matrix.feature }}
+      - run: cargo test --no-default-features --features ${{ matrix.feature }}
+      - run: cargo clippy --all-targets --no-default-features --features ${{ matrix.feature }} -- -D warnings
+      - run: cargo doc --no-deps --no-default-features --features ${{ matrix.feature }}
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
   msrv:
     name: msrv (1.82)
     runs-on: ubuntu-latest

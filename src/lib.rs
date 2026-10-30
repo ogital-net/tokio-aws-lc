@@ -6,7 +6,7 @@ pub mod config;
 pub mod connector;
 pub mod error;
 mod ffi;
-#[cfg(feature = "hyper")]
+#[cfg(any(feature = "hyper-client", feature = "hyper-server"))]
 pub mod hyper;
 mod ktls;
 pub mod session;

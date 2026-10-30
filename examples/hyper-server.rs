@@ -5,10 +5,10 @@
 //! builder. ALPN advertises both HTTP/1.1 and HTTP/2; the negotiated
 //! protocol is picked by the client.
 //!
-//! Requires the `hyper` feature:
+//! Requires the `hyper-server` feature:
 //!
 //! ```sh
-//! cargo run --example hyper-server --features hyper -- \
+//! cargo run --example hyper-server --features hyper-server -- \
 //!     127.0.0.1:8443 tests/data/cert.pem tests/data/key.pem
 //! ```
 //!
