@@ -553,55 +553,6 @@ fn ssl_io_error(op: &'static str, code: c_int) -> io::Error {
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ssl_io_error_classifies_and_drains_queue() {
-        for (library, reason, expected) in [
-            (
-                aws_lc_sys::ERR_LIB_SSL,
-                c_int::try_from(SSL_R_UNEXPECTED_EOF_WHILE_READING).unwrap(),
-                io::ErrorKind::UnexpectedEof,
-            ),
-            (
-                aws_lc_sys::ERR_LIB_SSL,
-                aws_lc_sys::SSL_R_DECRYPTION_FAILED_OR_BAD_RECORD_MAC,
-                io::ErrorKind::Other,
-            ),
-            (
-                aws_lc_sys::ERR_LIB_PEM,
-                c_int::try_from(SSL_R_UNEXPECTED_EOF_WHILE_READING).unwrap(),
-                io::ErrorKind::Other,
-            ),
-        ] {
-            // SAFETY: the queue is thread-local and the filename is static.
-            unsafe {
-                aws_lc_sys::ERR_clear_error();
-                aws_lc_sys::ERR_put_error(library, 0, reason, c"stream.rs".as_ptr(), line!());
-                aws_lc_sys::ERR_put_error(
-                    aws_lc_sys::ERR_LIB_SSL,
-                    0,
-                    aws_lc_sys::SSL_R_DECRYPTION_FAILED_OR_BAD_RECORD_MAC,
-                    c"stream.rs".as_ptr(),
-                    line!(),
-                );
-            }
-            let error = ssl_io_error("SSL_read", aws_lc_sys::SSL_ERROR_SSL);
-            assert_eq!(error.kind(), expected, "{error}");
-            if expected == io::ErrorKind::Other {
-                assert!(error.to_string().starts_with("SSL_read: ssl_error="));
-            }
-            // SAFETY: ERR_peek_error reads the current thread's error queue.
-            assert_eq!(unsafe { aws_lc_sys::ERR_peek_error() }, 0);
-        }
-        let error = ssl_io_error("SSL_read", aws_lc_sys::SSL_ERROR_SSL);
-        assert_eq!(error.kind(), io::ErrorKind::Other);
-        assert!(error.to_string().contains("(no error queued)"));
-    }
-}
-
 fn duplicate_io_error(error: &io::Error) -> io::Error {
     error.raw_os_error().map_or_else(
         || io::Error::new(error.kind(), error.to_string()),
@@ -678,5 +629,54 @@ pub(crate) async unsafe fn drive_handshake(ssl: &mut Ssl, tcp: &TcpStream) -> Re
                 )))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssl_io_error_classifies_and_drains_queue() {
+        for (library, reason, expected) in [
+            (
+                aws_lc_sys::ERR_LIB_SSL,
+                c_int::try_from(SSL_R_UNEXPECTED_EOF_WHILE_READING).unwrap(),
+                io::ErrorKind::UnexpectedEof,
+            ),
+            (
+                aws_lc_sys::ERR_LIB_SSL,
+                aws_lc_sys::SSL_R_DECRYPTION_FAILED_OR_BAD_RECORD_MAC,
+                io::ErrorKind::Other,
+            ),
+            (
+                aws_lc_sys::ERR_LIB_PEM,
+                c_int::try_from(SSL_R_UNEXPECTED_EOF_WHILE_READING).unwrap(),
+                io::ErrorKind::Other,
+            ),
+        ] {
+            // SAFETY: the queue is thread-local and the filename is static.
+            unsafe {
+                aws_lc_sys::ERR_clear_error();
+                aws_lc_sys::ERR_put_error(library, 0, reason, c"stream.rs".as_ptr(), line!());
+                aws_lc_sys::ERR_put_error(
+                    aws_lc_sys::ERR_LIB_SSL,
+                    0,
+                    aws_lc_sys::SSL_R_DECRYPTION_FAILED_OR_BAD_RECORD_MAC,
+                    c"stream.rs".as_ptr(),
+                    line!(),
+                );
+            }
+            let error = ssl_io_error("SSL_read", aws_lc_sys::SSL_ERROR_SSL);
+            assert_eq!(error.kind(), expected, "{error}");
+            if expected == io::ErrorKind::Other {
+                assert!(error.to_string().starts_with("SSL_read: ssl_error="));
+            }
+            // SAFETY: ERR_peek_error reads the current thread's error queue.
+            assert_eq!(unsafe { aws_lc_sys::ERR_peek_error() }, 0);
+        }
+        let error = ssl_io_error("SSL_read", aws_lc_sys::SSL_ERROR_SSL);
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("(no error queued)"));
     }
 }
