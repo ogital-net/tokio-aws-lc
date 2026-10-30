@@ -23,6 +23,10 @@ use crate::session::{export_keying_material, KtlsEligibility, NegotiatedSession}
 
 const MAX_PLAINTEXT: usize = 16 * 1024;
 
+// SSL_R_UNEXPECTED_EOF_WHILE_READING is absent from bindings before
+// aws-lc-sys 0.47. Keep its reason code here to support older versions.
+const SSL_R_UNEXPECTED_EOF_WHILE_READING: u32 = 509;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Shutdown {
     Open,
@@ -523,20 +527,79 @@ fn poll_clear_write_ready(tcp: &TcpStream, cx: &mut Context<'_>) -> Poll<io::Res
 }
 
 /// Build an `io::Error` from the last AWS-LC failure on the current
-/// thread, prefixed with which call surfaced it.
+/// thread, normalizing unexpected EOF across AWS-LC versions.
 fn ssl_io_error(op: &'static str, code: c_int) -> io::Error {
     let os_error = io::Error::last_os_error();
+    // Inspect the same (oldest) entry that last_error will format and drain.
+    // SAFETY: ERR_peek_error reads the current thread's error queue.
+    let packed = unsafe { aws_lc_sys::ERR_peek_error() };
+    // AWS-LC packs the library in the top byte and the reason in 12 bits.
+    #[allow(clippy::cast_possible_wrap)]
+    let library = ((packed >> 24) & 0xff) as c_int;
+    let unexpected_eof = code == aws_lc_sys::SSL_ERROR_SSL
+        && library == aws_lc_sys::ERR_LIB_SSL
+        && packed & 0xfff == SSL_R_UNEXPECTED_EOF_WHILE_READING;
     let detail = last_error();
     if code == aws_lc_sys::SSL_ERROR_SYSCALL {
         if os_error.raw_os_error().is_some_and(|errno| errno != 0) {
             return os_error;
         }
-        return io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "TLS peer closed without close_notify",
-        );
+    } else if !unexpected_eof {
+        return io::Error::other(format!("{op}: ssl_error={code} {detail}"));
     }
-    io::Error::other(format!("{op}: ssl_error={code} {detail}"))
+    io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "TLS peer closed without close_notify",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssl_io_error_classifies_and_drains_queue() {
+        for (library, reason, expected) in [
+            (
+                aws_lc_sys::ERR_LIB_SSL,
+                c_int::try_from(SSL_R_UNEXPECTED_EOF_WHILE_READING).unwrap(),
+                io::ErrorKind::UnexpectedEof,
+            ),
+            (
+                aws_lc_sys::ERR_LIB_SSL,
+                aws_lc_sys::SSL_R_DECRYPTION_FAILED_OR_BAD_RECORD_MAC,
+                io::ErrorKind::Other,
+            ),
+            (
+                aws_lc_sys::ERR_LIB_PEM,
+                c_int::try_from(SSL_R_UNEXPECTED_EOF_WHILE_READING).unwrap(),
+                io::ErrorKind::Other,
+            ),
+        ] {
+            // SAFETY: the queue is thread-local and the filename is static.
+            unsafe {
+                aws_lc_sys::ERR_clear_error();
+                aws_lc_sys::ERR_put_error(library, 0, reason, c"stream.rs".as_ptr(), line!());
+                aws_lc_sys::ERR_put_error(
+                    aws_lc_sys::ERR_LIB_SSL,
+                    0,
+                    aws_lc_sys::SSL_R_DECRYPTION_FAILED_OR_BAD_RECORD_MAC,
+                    c"stream.rs".as_ptr(),
+                    line!(),
+                );
+            }
+            let error = ssl_io_error("SSL_read", aws_lc_sys::SSL_ERROR_SSL);
+            assert_eq!(error.kind(), expected, "{error}");
+            if expected == io::ErrorKind::Other {
+                assert!(error.to_string().starts_with("SSL_read: ssl_error="));
+            }
+            // SAFETY: ERR_peek_error reads the current thread's error queue.
+            assert_eq!(unsafe { aws_lc_sys::ERR_peek_error() }, 0);
+        }
+        let error = ssl_io_error("SSL_read", aws_lc_sys::SSL_ERROR_SSL);
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("(no error queued)"));
+    }
 }
 
 fn duplicate_io_error(error: &io::Error) -> io::Error {
