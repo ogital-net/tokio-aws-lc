@@ -10,6 +10,7 @@ use tokio_aws_lc::{ClientAuthMode, ClientConfig, ServerConfig, TlsAcceptor, TlsC
 
 const CERT_PEM: &[u8] = include_bytes!("data/cert.pem");
 const KEY_PEM: &[u8] = include_bytes!("data/key.pem");
+const CERT_DER: &[u8] = include_bytes!("data/cert.der");
 
 #[tokio::test]
 async fn server_and_client_round_trip_in_process() {
@@ -36,6 +37,7 @@ async fn server_and_client_round_trip_in_process() {
     let server = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
         let mut stream = acceptor.accept(tcp).await.expect("server handshake");
+        assert_eq!(stream.peer_certificate_der().unwrap(), None);
         stream
             .write_all(b"ping from server")
             .await
@@ -177,9 +179,12 @@ async fn shutdown_reports_peer_reset_without_close_notify() {
 
 #[tokio::test]
 async fn mutual_tls_required_round_trip() {
+    const CLIENT_CERT_PEM: &[u8] = include_bytes!("data/cert2.pem");
+    const CLIENT_KEY_PEM: &[u8] = include_bytes!("data/cert2-key.pem");
+
     let server_cfg = Arc::new(
         ServerConfig::builder()
-            .client_auth(ClientAuthMode::Required, CERT_PEM)
+            .client_auth(ClientAuthMode::Required, CLIENT_CERT_PEM)
             .with_pem_bytes(CERT_PEM, KEY_PEM)
             .expect("mTLS-required ServerConfig builds"),
     );
@@ -188,7 +193,7 @@ async fn mutual_tls_required_round_trip() {
     let client_cfg = Arc::new(
         ClientConfig::builder()
             .with_root_certs_pem_bytes(CERT_PEM)
-            .with_client_auth_pem_bytes(CERT_PEM, KEY_PEM)
+            .with_client_auth_pem_bytes(CLIENT_CERT_PEM, CLIENT_KEY_PEM)
             .build()
             .expect("mTLS ClientConfig builds"),
     );
@@ -204,6 +209,11 @@ async fn mutual_tls_required_round_trip() {
             stream.has_peer_certificate(),
             "server should have received a client cert"
         );
+        let cert = stream
+            .peer_certificate_der()
+            .expect("client certificate DER");
+        assert_eq!(stream.peer_certificate_der().unwrap(), cert);
+        cert.expect("client presented a certificate")
     });
 
     let client = tokio::spawn(async move {
@@ -218,10 +228,28 @@ async fn mutual_tls_required_round_trip() {
             stream.has_peer_certificate(),
             "client should have received a server cert"
         );
+        let cert = stream
+            .peer_certificate_der()
+            .expect("server certificate DER");
+        assert_eq!(cert.as_deref(), Some(CERT_DER));
+        assert_eq!(stream.peer_certificate_der().unwrap(), cert);
     });
 
-    server.await.unwrap();
+    let client_cert = server.await.unwrap();
     client.await.unwrap();
+
+    let expected = std::process::Command::new("openssl")
+        .args(["x509", "-in"])
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/cert2.pem"))
+        .args(["-outform", "DER"])
+        .output()
+        .expect("openssl x509");
+    assert!(
+        expected.status.success(),
+        "openssl x509 failed: {expected:?}"
+    );
+    assert_eq!(client_cert, expected.stdout);
+    assert_ne!(client_cert, CERT_DER);
 }
 
 #[tokio::test]
@@ -553,6 +581,7 @@ async fn mtls_optional_accepts_client_without_cert() {
             !stream.has_peer_certificate(),
             "client did not send a cert, so the server should not see one"
         );
+        assert_eq!(stream.peer_certificate_der().unwrap(), None);
     });
 
     let tcp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();

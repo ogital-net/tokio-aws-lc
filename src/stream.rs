@@ -18,7 +18,7 @@ use tokio::io::{AsyncRead, AsyncWrite, Interest, ReadBuf};
 use tokio::net::TcpStream;
 
 use crate::error::{last_error, Error, KtlsError, Result};
-use crate::ffi::Ssl;
+use crate::ffi::{Ssl, X509};
 use crate::session::{export_keying_material, KtlsEligibility, NegotiatedSession};
 
 const MAX_PLAINTEXT: usize = 16 * 1024;
@@ -333,6 +333,36 @@ impl TlsStream {
             }
             true
         }
+    }
+
+    /// Return the peer's leaf certificate encoded as DER, or `None` if
+    /// the peer did not present a certificate. This does not include the
+    /// certificate chain. The returned bytes are owned by the caller.
+    ///
+    /// On a server, use [`crate::ClientAuthMode::Required`] to require an
+    /// authenticated client certificate. Certificate presence alone does
+    /// not imply successful verification if verification was disabled.
+    /// This accessor also works when kTLS is active.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if AWS-LC cannot encode the certificate as DER.
+    pub fn peer_certificate_der(&self) -> Result<Option<Vec<u8>>> {
+        let cert =
+            unsafe { X509::from_raw(aws_lc_sys::SSL_get_peer_certificate(self.ssl.as_ptr())) };
+        let Some(cert) = cert else {
+            return Ok(None);
+        };
+        let len = unsafe { aws_lc_sys::i2d_X509(cert.as_ptr(), std::ptr::null_mut()) };
+        if len <= 0 {
+            return Err(io::Error::other(format!("i2d_X509: {}", last_error())).into());
+        }
+        let mut der = vec![0; usize::try_from(len).expect("positive DER length")];
+        let mut out = der.as_mut_ptr();
+        if unsafe { aws_lc_sys::i2d_X509(cert.as_ptr(), &raw mut out) } != len {
+            return Err(io::Error::other(format!("i2d_X509: {}", last_error())).into());
+        }
+        Ok(Some(der))
     }
 }
 

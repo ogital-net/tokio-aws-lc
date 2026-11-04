@@ -159,6 +159,42 @@ names go out as the SNI extension and are matched against the
 certificate's DNS SANs / CN; IP literals skip SNI (RFC 6066 Sec 3) and
 are matched against the certificate's iPAddress SANs.
 
+### Mutual TLS and peer identity
+
+Require a client certificate using a PEM bundle of trusted client roots:
+
+```rust,no_run
+use std::sync::Arc;
+use tokio_aws_lc::{ClientAuthMode, ServerConfig, TlsAcceptor};
+
+# async fn identify(tcp: tokio::net::TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+let roots = std::fs::read("trusted-clients.pem")?;
+let cfg = Arc::new(
+  ServerConfig::builder()
+    .client_auth(ClientAuthMode::Required, &roots)
+    .alpn_protocols(&[b"h2", b"http/1.1"])
+    .with_pem_files("cert.pem".as_ref(), "key.pem".as_ref())?,
+);
+let tls = TlsAcceptor::new(cfg).accept(tcp).await?;
+let _peer_der = tls.peer_certificate_der()?.ok_or("missing client certificate")?;
+# Ok(())
+# }
+```
+
+`peer_certificate_der()` returns `Result<Option<Vec<u8>>>`: an owned DER
+encoding of the peer's leaf certificate, or `None` when no certificate was
+presented. It works on both client and server streams, including with kTLS.
+Clients present their identity using `with_client_auth_pem_bytes` or
+`with_client_auth_der_bytes` on `ClientConfigBuilder`.
+
+For enrolled self-signed clients, the trust bundle can contain the enrolled
+certificates themselves. A round-trip test covers a self-signed P-256 client
+certificate with `CA:FALSE` trusted directly. For SPKI pinning, extract the
+certificate's DER-encoded `SubjectPublicKeyInfo` and hash that, not the whole
+certificate. Check the pin against the enrolled identities before accepting
+application messages; this accessor does not enforce application-level pins
+or revoke existing sessions.
+
 ### Userspace writes
 
 Each userspace `poll_write` accepts at most one 16 KiB plaintext chunk.
