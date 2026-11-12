@@ -5,7 +5,7 @@
 //! `TOKIO_AWS_LC_REQUIRE_KTLS=1` to turn those explicit skips into failures.
 
 use std::future::{poll_fn, Future};
-use std::io;
+use std::io::{self, IoSlice};
 use std::pin::{pin, Pin};
 use std::sync::Arc;
 use std::task::Poll;
@@ -236,6 +236,16 @@ async fn assert_shutdown_idempotent(stream: &mut TlsStream) {
     }
     let error = stream.write(b"write after shutdown").await.unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    let error = stream
+        .write_vectored(&[IoSlice::new(&[]), IoSlice::new(b"write after shutdown")])
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    assert_eq!(stream.write_vectored(&[]).await.unwrap(), 0);
+    assert_eq!(
+        stream.write_vectored(&[IoSlice::new(&[])]).await.unwrap(),
+        0
+    );
     stream
         .flush()
         .await
@@ -576,6 +586,180 @@ mod kernel_probe {
         }
         true
     }
+}
+
+async fn vectored_roundtrip(version: ProtocolVersion, offload: Offload) {
+    let (mut client, mut server) = tls_pair(version, offload).await;
+    for client_sends in [true, false] {
+        let (sender, receiver) = if client_sends {
+            (&mut client, &mut server)
+        } else {
+            (&mut server, &mut client)
+        };
+        assert_eq!(sender.is_write_vectored(), sender.ktls_active());
+        assert_eq!(sender.write_vectored(&[]).await.unwrap(), 0);
+        assert_eq!(
+            sender
+                .write_vectored(&[IoSlice::new(&[]), IoSlice::new(&[])])
+                .await
+                .unwrap(),
+            0
+        );
+        let bufs = [
+            IoSlice::new(&[]),
+            IoSlice::new(b"header"),
+            IoSlice::new(&[]),
+            IoSlice::new(b"body"),
+            IoSlice::new(b"tail"),
+            IoSlice::new(&[]),
+        ];
+        let written = sender.write_vectored(&bufs).await.unwrap();
+        let expected = if sender.ktls_active() {
+            &b"headerbodytail"[..]
+        } else {
+            &b"header"[..]
+        };
+        assert_eq!(written, expected.len());
+        sender.flush().await.unwrap();
+        let mut actual = vec![0; written];
+        receiver.read_exact(&mut actual).await.unwrap();
+        assert_bytes(&actual, expected);
+    }
+}
+
+async fn write_vectored_once(
+    stream: &mut TlsStream,
+    bytes: &[u8],
+    split: usize,
+) -> Poll<io::Result<usize>> {
+    let bufs = [
+        IoSlice::new(&[]),
+        IoSlice::new(&bytes[..split]),
+        IoSlice::new(&[]),
+        IoSlice::new(&bytes[split..]),
+        IoSlice::new(&[]),
+    ];
+    let mut write = pin!(stream.write_vectored(&bufs));
+    poll_fn(|cx| Poll::Ready(write.as_mut().poll(cx))).await
+}
+
+fn record_vectored_accepted(
+    result: io::Result<usize>,
+    bytes: &[u8],
+    expected: &mut Vec<u8>,
+) -> bool {
+    let written = result.expect("vectored write/retry must succeed");
+    assert!(written > 0 && written <= bytes.len());
+    expected.extend_from_slice(&bytes[..written]);
+    written < bytes.len()
+}
+
+async fn stall_vectored_writer(stream: &mut TlsStream) -> Vec<u8> {
+    let mut expected = Vec::new();
+    let mut saw_partial = false;
+    for sequence in 1..=1024 {
+        let mut bytes = pattern(16 * RECORD + 113, sequence);
+        match write_vectored_once(stream, &bytes, RECORD + 7).await {
+            Poll::Ready(result) => {
+                saw_partial |= record_vectored_accepted(result, &bytes, &mut expected);
+                bytes.fill(0xee);
+            }
+            Poll::Pending => {
+                let mut moved = bytes.clone();
+                assert_ne!(moved.as_ptr(), bytes.as_ptr());
+                bytes.fill(0xdd);
+                drop(bytes);
+                match write_vectored_once(stream, &moved, 37).await {
+                    Poll::Ready(result) => {
+                        saw_partial |= record_vectored_accepted(result, &moved, &mut expected);
+                        moved.fill(0xcc);
+                    }
+                    Poll::Pending => {
+                        assert!(
+                            saw_partial,
+                            "expected a partial vectored write before stalling"
+                        );
+                        assert_ne!(expected, [] as [u8; 0]);
+                        moved.fill(0xbb);
+                        return expected;
+                    }
+                }
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("paused peer never produced a pending vectored write");
+}
+
+async fn vectored_backpressure(version: ProtocolVersion, offload: Offload) {
+    let (client, server) = tls_pair(version, offload).await;
+    let (mut sender, mut receiver) = if matches!(offload, Offload::ServerOnly) {
+        (server, client)
+    } else {
+        (client, server)
+    };
+    let mut expected = stall_vectored_writer(&mut sender).await;
+    assert_eq!(sender.write_vectored(&[]).await.unwrap(), 0);
+    assert_eq!(
+        sender.write_vectored(&[IoSlice::new(&[])]).await.unwrap(),
+        0
+    );
+    let replacement = pattern(3 * RECORD + 73, 0x9876_5432);
+    let scalar_tail = b"scalar write after cancelled and partial vectored writes";
+    expected.extend_from_slice(&replacement);
+    expected.extend_from_slice(scalar_tail);
+    let send = async {
+        let mut bufs = &mut [
+            IoSlice::new(&[]),
+            IoSlice::new(&replacement[..13]),
+            IoSlice::new(&replacement[13..RECORD + 29]),
+            IoSlice::new(&[]),
+            IoSlice::new(&replacement[RECORD + 29..]),
+            IoSlice::new(&[]),
+        ][..];
+        while !bufs.is_empty() {
+            let written = sender.write_vectored(bufs).await.unwrap();
+            assert!(written > 0, "nonempty vectored write made no progress");
+            IoSlice::advance_slices(&mut bufs, written);
+        }
+        sender.flush().await.unwrap();
+        sender.write_all(scalar_tail).await.unwrap();
+        sender.shutdown().await.unwrap();
+        assert_shutdown_idempotent(&mut sender).await;
+    };
+    let receive = async {
+        let mut actual = Vec::new();
+        receiver.read_to_end(&mut actual).await.unwrap();
+        assert_bytes(&actual, &expected);
+    };
+    tokio::join!(send, receive);
+}
+
+#[tokio::test]
+async fn userspace_vectored_writes() {
+    bounded(async {
+        for version in [ProtocolVersion::Tls12, ProtocolVersion::Tls13] {
+            vectored_roundtrip(version, Offload::Disabled).await;
+            vectored_backpressure(version, Offload::Disabled).await;
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn ktls_vectored_writes() {
+    bounded(async {
+        for version in [ProtocolVersion::Tls12, ProtocolVersion::Tls13] {
+            if !ktls_supported(version).await {
+                continue;
+            }
+            for offload in [Offload::ClientOnly, Offload::ServerOnly, Offload::Both] {
+                vectored_roundtrip(version, offload).await;
+                vectored_backpressure(version, offload).await;
+            }
+        }
+    })
+    .await;
 }
 
 macro_rules! userspace_case {

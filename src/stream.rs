@@ -7,7 +7,7 @@
 //! underlying socket on drop. The crate-internal handshake driver lives
 //! here too so both server and client paths can share it.
 
-use std::io;
+use std::io::{self, IoSlice};
 use std::os::fd::AsRawFd as _;
 use std::os::raw::c_int;
 use std::pin::Pin;
@@ -78,6 +78,10 @@ impl Wake for IoWaiters {
 /// at most one 16 KiB plaintext chunk is buffered and reported as accepted.
 /// Call `flush()` or `shutdown()` to finish sending it. A write returning
 /// `Pending` has not accepted any bytes from that call's buffer.
+///
+/// When kTLS is active, vectored writes submit multiple plaintext buffers
+/// directly to the socket without concatenating them. Userspace TLS falls
+/// back to writing the first nonempty buffer.
 pub struct TlsStream {
     // Field order matters for Drop: `ssl` drops first, freeing the SSL
     // and dropping one SSL_CTX refcount (the CTX-owned ALPN buffer and
@@ -437,7 +441,7 @@ impl AsyncWrite for TlsStream {
             )));
         }
         if this.ktls_active {
-            return ktls_poll_write(&this.tcp, cx, buf);
+            return ktls_poll_write(&this.tcp, cx, |tcp| tcp.try_write(buf));
         }
         ready!(this.poll_pending_write(cx, false))?;
         let chunk = &buf[..buf.len().min(MAX_PLAINTEXT)];
@@ -461,6 +465,38 @@ impl AsyncWrite for TlsStream {
             let error = ssl_io_error("SSL_write", code);
             Poll::Ready(Err(this.write_failure(error)))
         }
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        if !self.ktls_active {
+            let buf = bufs
+                .iter()
+                .find(|buf| !buf.is_empty())
+                .map_or(&[][..], |buf| &**buf);
+            return self.poll_write(cx, buf);
+        }
+        if bufs.iter().all(|buf| buf.is_empty()) {
+            return Poll::Ready(Ok(0));
+        }
+        let this = &mut *self;
+        if let Some(error) = &this.write_error {
+            return Poll::Ready(Err(duplicate_io_error(error)));
+        }
+        if this.shutdown != Shutdown::Open {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "TLS write half is shut down",
+            )));
+        }
+        ktls_poll_write(&this.tcp, cx, |tcp| tcp.try_write_vectored(bufs))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.ktls_active
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -511,10 +547,14 @@ impl AsyncWrite for TlsStream {
     }
 }
 
-/// kTLS-mode `poll_write`: `write(2)` plaintext directly to the socket.
-fn ktls_poll_write(tcp: &TcpStream, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+/// Poll a plaintext socket write in kTLS mode.
+fn ktls_poll_write(
+    tcp: &TcpStream,
+    cx: &mut Context<'_>,
+    mut write: impl FnMut(&TcpStream) -> io::Result<usize>,
+) -> Poll<io::Result<usize>> {
     loop {
-        match tcp.try_write(buf) {
+        match write(tcp) {
             Ok(n) => return Poll::Ready(Ok(n)),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => match tcp.poll_write_ready(cx) {
                 Poll::Ready(Ok(())) => {}

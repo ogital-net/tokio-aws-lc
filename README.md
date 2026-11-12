@@ -312,6 +312,20 @@ Host prerequisites:
   `/etc/modules-load.d/`). Inside containers, the host kernel must
   provide it.
 
+### Vectored writes
+
+When kTLS is active, `AsyncWrite::is_write_vectored()` returns `true` and
+`write_vectored(&[IoSlice])` submits plaintext buffers directly through
+`writev(2)`, without concatenating them in userspace. Buffers are consumed
+in order, but their boundaries do not define TLS record boundaries. This
+does not imply zero-copy encryption.
+
+A successful call may accept only part of the combined input; advance the
+slices by the returned byte count before retrying. `Pending` accepts no
+bytes, so cancellation does not require retaining the supplied buffers.
+Empty inputs return zero. With userspace TLS, `is_write_vectored()` returns
+`false` and vectored writes use the scalar first-nonempty-buffer fallback.
+
 ### Control records and shutdown
 
 kTLS shutdown sends a proper TLS `close_notify` alert using `sendmsg(2)`
