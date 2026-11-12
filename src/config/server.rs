@@ -18,6 +18,8 @@ use super::cipher_suite::{self, CipherSuite};
 use super::named_group::{self, NamedGroup};
 use super::{encode_alpn_wire, iter_alpn_wire, ProtocolVersion};
 
+const MAX_CERT_DEPTH: c_int = 5;
+
 /// A built, immutable server-side TLS configuration. Cheap to clone via
 /// the wrapping `Arc`; share one across many [`crate::TlsAcceptor`]s if
 /// you like.
@@ -184,6 +186,8 @@ impl ServerConfigBuilder {
     /// contain the PEM-encoded CA bundle the client's certificate is
     /// verified against.
     ///
+    /// Client certificate verification uses a maximum depth of 5.
+    ///
     /// [`mode`]: ClientAuthMode
     #[must_use]
     pub fn client_auth(mut self, mode: ClientAuthMode, roots_pem: &[u8]) -> Self {
@@ -343,6 +347,7 @@ impl ServerConfigBuilder {
                 // SAFETY: ctx is live.
                 unsafe {
                     aws_lc_sys::SSL_CTX_set_verify(ctx.as_ptr(), flags, None);
+                    aws_lc_sys::SSL_CTX_set_verify_depth(ctx.as_ptr(), MAX_CERT_DEPTH);
                 }
             }
         }
@@ -762,6 +767,18 @@ mod tests {
     const TEST_KEY_PEM: &[u8] = include_bytes!("../../tests/data/key.pem");
     const TEST_CERT_DER: &[u8] = include_bytes!("../../tests/data/cert.der");
     const TEST_KEY_DER: &[u8] = include_bytes!("../../tests/data/key.der");
+
+    #[test]
+    fn client_auth_limits_certificate_verification_depth() {
+        for mode in [ClientAuthMode::Optional, ClientAuthMode::Required] {
+            let cfg = ServerConfig::builder()
+                .client_auth(mode, TEST_CERT_PEM)
+                .with_der_bytes(&[TEST_CERT_DER], TEST_KEY_DER)
+                .expect("config should build with client auth");
+            let depth = unsafe { aws_lc_sys::SSL_CTX_get_verify_depth(cfg.ctx_ptr()) };
+            assert_eq!(depth, 5, "unexpected verification depth for {mode:?}");
+        }
+    }
 
     #[test]
     fn builds_from_valid_pem_bytes() {
