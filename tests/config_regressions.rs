@@ -1,5 +1,8 @@
 //! Configuration regressions use loopback TCP and explicitly disable kTLS.
 
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,12 +11,17 @@ use tokio_aws_lc::cipher_suite::{
     TLS13_AES_128_GCM_SHA256, TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
 };
 use tokio_aws_lc::{
-    CipherSuite, ClientConfig, ClientConfigBuilder, Error, ProtocolVersion, Result, ServerConfig,
-    ServerConfigBuilder, TlsAcceptor, TlsConnector, TlsStream,
+    CipherSuite, ClientAuthMode, ClientConfig, ClientConfigBuilder, Error, ProtocolVersion, Result,
+    ServerConfig, ServerConfigBuilder, TlsAcceptor, TlsConnector, TlsStream,
 };
 
 const CERT_DER: &[u8] = include_bytes!("data/cert.der");
 const KEY_DER: &[u8] = include_bytes!("data/key.der");
+const CERT_PEM: &[u8] = include_bytes!("data/cert.pem");
+const KEY_PEM: &[u8] = include_bytes!("data/key.pem");
+const KEY_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/key.pem");
+const CA_EXTENSIONS: &str =
+    "basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\n";
 const MIXED: &[&CipherSuite] = &[
     TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
     TLS13_AES_128_GCM_SHA256,
@@ -50,9 +58,84 @@ fn server_builder() -> ServerConfigBuilder {
     ServerConfig::builder().disable_ktls()
 }
 
+fn openssl(command: &mut Command) -> Vec<u8> {
+    let output = command.output().expect("run openssl");
+    assert!(
+        output.status.success(),
+        "{command:?} failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+struct TestCertificates(PathBuf);
+
+impl TestCertificates {
+    fn new() -> Self {
+        static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "tokio-aws-lc-config-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        Self(dir)
+    }
+
+    fn issue(&self, name: &str, issuer: Option<&str>, extensions: &str) -> Vec<u8> {
+        static NEXT_SERIAL: AtomicU64 = AtomicU64::new(1);
+        let csr = self.0.join(format!("{name}.csr"));
+        let cert = self.0.join(format!("{name}.pem"));
+        let extfile = self.0.join(format!("{name}.ext"));
+        std::fs::write(&extfile, extensions).unwrap();
+        openssl(
+            Command::new("openssl")
+                .args(["req", "-new", "-sha256", "-key", KEY_PATH])
+                .args(["-subj", &format!("/CN={name}")])
+                .arg("-out")
+                .arg(&csr),
+        );
+        let mut command = Command::new("openssl");
+        command
+            .args(["x509", "-req", "-sha256", "-days", "1", "-in"])
+            .arg(csr)
+            .arg("-extfile")
+            .arg(extfile)
+            .arg("-set_serial")
+            .arg(NEXT_SERIAL.fetch_add(1, Ordering::Relaxed).to_string())
+            .arg("-out")
+            .arg(&cert);
+        if let Some(issuer) = issuer {
+            command
+                .arg("-CA")
+                .arg(self.0.join(format!("{issuer}.pem")))
+                .args(["-CAkey", KEY_PATH]);
+        } else {
+            command.args(["-signkey", KEY_PATH]);
+        }
+        openssl(&mut command);
+        std::fs::read(cert).unwrap()
+    }
+}
+
+impl Drop for TestCertificates {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 async fn handshake(
     client: ClientConfig,
     server: ServerConfig,
+) -> (Result<TlsStream>, Result<TlsStream>) {
+    handshake_named(client, server, "localhost").await
+}
+
+async fn handshake_named(
+    client: ClientConfig,
+    server: ServerConfig,
+    server_name: &str,
 ) -> (Result<TlsStream>, Result<TlsStream>) {
     tokio::time::timeout(Duration::from_secs(5), async move {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -64,7 +147,7 @@ async fn handshake(
         tokio::join!(
             async {
                 let tcp = TcpStream::connect(addr).await.unwrap();
-                connector.connect("localhost", tcp).await
+                connector.connect(server_name, tcp).await
             },
             async {
                 let (tcp, _) = listener.accept().await.unwrap();
@@ -74,6 +157,257 @@ async fn handshake(
     })
     .await
     .expect("configuration handshake must finish, not hang")
+}
+
+fn server_certificate(common_name: &str, san: Option<&str>) -> Vec<u8> {
+    let mut command = Command::new("openssl");
+    command
+        .args(["req", "-new", "-x509", "-sha256", "-days", "1", "-key"])
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/key.pem"))
+        .args(["-subj", &format!("/CN={common_name}")])
+        .args(["-addext", "basicConstraints=critical,CA:FALSE"])
+        .args(["-addext", "extendedKeyUsage=serverAuth"]);
+    if let Some(san) = san {
+        command.args(["-addext", &format!("subjectAltName={san}")]);
+    }
+    let output = command.output().expect("openssl req");
+    assert!(output.status.success(), "openssl req failed: {output:?}");
+    output.stdout
+}
+
+#[tokio::test]
+async fn common_name_fallback_is_explicit_and_can_be_disabled_again() {
+    let cert = server_certificate("localhost", None);
+    for version in [ProtocolVersion::Tls12, ProtocolVersion::Tls13] {
+        for fallback in [None, Some(true), Some(false)] {
+            let mut builder = ClientConfig::builder()
+                .with_root_certs_pem_bytes(&cert)
+                .disable_ktls();
+            if let Some(allow) = fallback {
+                builder = builder
+                    .allow_common_name_fallback(true)
+                    .allow_common_name_fallback(allow);
+            }
+            let client = builder.build().unwrap();
+            let server = server_builder()
+                .min_protocol_version(version)
+                .max_protocol_version(version)
+                .with_pem_bytes(&cert, include_bytes!("data/key.pem"))
+                .unwrap();
+            let (client, server) = handshake(client, server).await;
+            assert_eq!(
+                client.is_ok(),
+                fallback == Some(true),
+                "{version:?}, {fallback:?}: {client:?}"
+            );
+            assert_eq!(
+                server.is_ok(),
+                fallback == Some(true),
+                "{version:?}, {fallback:?}: {server:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn dns_sans_take_precedence_over_common_name() {
+    for (common_name, san, accepted) in [
+        ("localhost", "DNS:other.invalid", false),
+        ("other.invalid", "DNS:localhost", true),
+    ] {
+        let cert = server_certificate(common_name, Some(san));
+        for version in [ProtocolVersion::Tls12, ProtocolVersion::Tls13] {
+            for fallback in [false, true] {
+                let client = ClientConfig::builder()
+                    .with_root_certs_pem_bytes(&cert)
+                    .allow_common_name_fallback(fallback)
+                    .disable_ktls()
+                    .build()
+                    .unwrap();
+                let server = server_builder()
+                    .min_protocol_version(version)
+                    .max_protocol_version(version)
+                    .with_pem_bytes(&cert, include_bytes!("data/key.pem"))
+                    .unwrap();
+                let (client, server) = handshake(client, server).await;
+                assert_eq!(
+                    client.is_ok(),
+                    accepted,
+                    "{version:?}, {fallback}: {client:?}"
+                );
+                assert_eq!(
+                    server.is_ok(),
+                    accepted,
+                    "{version:?}, {fallback}: {server:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn common_name_fallback_never_authenticates_ip_addresses() {
+    let cert = server_certificate("127.0.0.1", None);
+    for fallback in [false, true] {
+        let client = ClientConfig::builder()
+            .with_root_certs_pem_bytes(&cert)
+            .allow_common_name_fallback(fallback)
+            .disable_ktls()
+            .build()
+            .unwrap();
+        let server = server_builder()
+            .with_pem_bytes(&cert, include_bytes!("data/key.pem"))
+            .unwrap();
+        let (client, server) = handshake_named(client, server, "127.0.0.1").await;
+        assert!(client.is_err());
+        assert!(server.is_err());
+    }
+}
+
+#[tokio::test]
+async fn mtls_accepts_five_intermediates_and_rejects_six() {
+    let certificates = TestCertificates::new();
+    let root = certificates.issue("root", None, CA_EXTENSIONS);
+    let mut intermediates = Vec::new();
+    for depth in 1..=6 {
+        let issuer = if depth == 1 {
+            "root".to_owned()
+        } else {
+            format!("intermediate-{}", depth - 1)
+        };
+        intermediates.push(certificates.issue(
+            &format!("intermediate-{depth}"),
+            Some(&issuer),
+            CA_EXTENSIONS,
+        ));
+    }
+    for depth in [5, 6] {
+        let leaf_name = format!("client-{depth}");
+        let mut chain = certificates.issue(
+            &leaf_name,
+            Some(&format!("intermediate-{depth}")),
+            "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n",
+        );
+        let mut untrusted = Vec::new();
+        for intermediate in intermediates[..depth].iter().rev() {
+            untrusted.extend_from_slice(intermediate);
+        }
+        let untrusted_path = certificates.0.join("intermediates.pem");
+        std::fs::write(&untrusted_path, &untrusted).unwrap();
+        openssl(
+            Command::new("openssl")
+                .args([
+                    "verify",
+                    "-purpose",
+                    "sslclient",
+                    "-verify_depth",
+                    "6",
+                    "-CAfile",
+                ])
+                .arg(certificates.0.join("root.pem"))
+                .arg("-untrusted")
+                .arg(untrusted_path)
+                .arg(certificates.0.join(format!("{leaf_name}.pem"))),
+        );
+        chain.extend_from_slice(&untrusted);
+        chain.extend_from_slice(&root);
+        for version in [ProtocolVersion::Tls12, ProtocolVersion::Tls13] {
+            for mode in [ClientAuthMode::Optional, ClientAuthMode::Required] {
+                let client = client_builder()
+                    .with_client_auth_pem_bytes(&chain, KEY_PEM)
+                    .build()
+                    .unwrap();
+                let server = server_builder()
+                    .client_auth(mode, &root)
+                    .min_protocol_version(version)
+                    .max_protocol_version(version)
+                    .with_der_bytes(&[CERT_DER], KEY_DER)
+                    .unwrap();
+                let (client, server) = handshake(client, server).await;
+                if depth == 5 {
+                    assert!(client.is_ok(), "{version:?}, {mode:?}: {client:?}");
+                    assert!(server.is_ok(), "{version:?}, {mode:?}: {server:?}");
+                } else {
+                    assert!(
+                        matches!(server, Err(Error::Handshake(_))),
+                        "{version:?}, {mode:?}: {server:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn mtls_trust_roots_exclude_default_verify_paths() {
+    const CHILD_ROOTS_DIR: &str = "TOKIO_AWS_LC_TEST_DEFAULT_ROOTS_DIR";
+    let Some(dir) = std::env::var_os(CHILD_ROOTS_DIR) else {
+        let certificates = TestCertificates::new();
+        certificates.issue("root", None, CA_EXTENSIONS);
+        certificates.issue(
+            "peer",
+            Some("root"),
+            "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth,clientAuth\nsubjectAltName=DNS:localhost\n",
+        );
+        let empty_dir = certificates.0.join("empty");
+        std::fs::create_dir(&empty_dir).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "mtls_trust_roots_exclude_default_verify_paths",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOTS_DIR, &certificates.0)
+            .env("SSL_CERT_FILE", certificates.0.join("root.pem"))
+            .env("SSL_CERT_DIR", empty_dir)
+            .output()
+            .expect("run trust-isolation test subprocess");
+        assert!(
+            output.status.success(),
+            "trust-isolation subprocess failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let root = std::fs::read(dir.join("root.pem")).unwrap();
+    let cert = std::fs::read(dir.join("peer.pem")).unwrap();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            for version in [ProtocolVersion::Tls12, ProtocolVersion::Tls13] {
+                for mode in [ClientAuthMode::Optional, ClientAuthMode::Required] {
+                    for explicitly_trusted in [true, false] {
+                        let client = ClientConfig::builder()
+                            .with_system_root_certs()
+                            .with_client_auth_pem_bytes(&cert, KEY_PEM)
+                            .disable_ktls()
+                            .build()
+                            .unwrap();
+                        let roots = if explicitly_trusted { &root } else { CERT_PEM };
+                        let server = server_builder()
+                            .client_auth(mode, roots)
+                            .min_protocol_version(version)
+                            .max_protocol_version(version)
+                            .with_pem_bytes(&cert, KEY_PEM)
+                            .unwrap();
+                        let (client, server) = handshake(client, server).await;
+                        if explicitly_trusted {
+                            assert!(client.is_ok(), "default roots must verify server: {client:?}");
+                            assert!(server.is_ok(), "explicit roots must verify client: {server:?}");
+                        } else {
+                            assert!(
+                                matches!(server, Err(Error::Handshake(_))),
+                                "{version:?}, {mode:?}: default roots must not verify client: {server:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        });
 }
 
 async fn assert_rejected(client: ClientConfig, server: ServerConfig) {

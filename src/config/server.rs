@@ -12,7 +12,7 @@ use std::ptr;
 use std::sync::OnceLock;
 
 use crate::error::{last_error, pem_eof_or_err, Error, Result};
-use crate::ffi::SslCtx;
+use crate::ffi::{SslCtx, X509};
 
 use super::cipher_suite::{self, CipherSuite};
 use super::named_group::{self, NamedGroup};
@@ -186,7 +186,10 @@ impl ServerConfigBuilder {
     /// contain the PEM-encoded CA bundle the client's certificate is
     /// verified against.
     ///
-    /// Client certificate verification uses a maximum depth of 5.
+    /// Client certificate verification accepts at most 5 intermediate
+    /// certificates, excluding the leaf and trust anchor. Only the supplied
+    /// roots are trusted; system roots are not loaded. Their subject names
+    /// are advertised to clients as certificate-selection hints.
     ///
     /// [`mode`]: ClientAuthMode
     #[must_use]
@@ -610,20 +613,31 @@ fn load_client_ca_roots_pem(ctx: &SslCtx, pem: &[u8]) -> Result<()> {
     let mut added = 0usize;
     loop {
         // SAFETY: bio is live; null trio means no password callback.
-        let cert =
-            unsafe { aws_lc_sys::PEM_read_bio_X509(bio.0, ptr::null_mut(), None, ptr::null_mut()) };
-        if cert.is_null() {
+        let cert = unsafe {
+            X509::from_raw(aws_lc_sys::PEM_read_bio_X509(
+                bio.0,
+                ptr::null_mut(),
+                None,
+                ptr::null_mut(),
+            ))
+        };
+        let Some(cert) = cert else {
             pem_eof_or_err("PEM_read_bio_X509 (client CA roots)")?;
             break;
-        }
+        };
         // SAFETY: store and cert are live; X509_STORE_add_cert bumps the
         // X509 refcount internally.
-        let ok = unsafe { aws_lc_sys::X509_STORE_add_cert(store, cert) };
-        // SAFETY: we own a local refcount regardless.
-        unsafe { aws_lc_sys::X509_free(cert) };
+        let ok = unsafe { aws_lc_sys::X509_STORE_add_cert(store, cert.as_ptr()) };
         if ok != 1 {
             return Err(Error::Init(format!(
                 "X509_STORE_add_cert (client CA): {}",
+                last_error()
+            )));
+        }
+        let ok = unsafe { aws_lc_sys::SSL_CTX_add_client_CA(ctx.as_ptr(), cert.as_ptr()) };
+        if ok != 1 {
+            return Err(Error::Init(format!(
+                "SSL_CTX_add_client_CA: {}",
                 last_error()
             )));
         }
@@ -778,6 +792,37 @@ mod tests {
             let depth = unsafe { aws_lc_sys::SSL_CTX_get_verify_depth(cfg.ctx_ptr()) };
             assert_eq!(depth, 5, "unexpected verification depth for {mode:?}");
         }
+    }
+
+    #[test]
+    fn client_auth_advertises_configured_ca_names() {
+        let mut roots = TEST_CERT_PEM.to_vec();
+        roots.extend_from_slice(include_bytes!("../../tests/data/cert2.pem"));
+        for mode in [ClientAuthMode::Optional, ClientAuthMode::Required] {
+            let cfg = ServerConfig::builder()
+                .client_auth(mode, &roots)
+                .with_der_bytes(&[TEST_CERT_DER], TEST_KEY_DER)
+                .expect("config should build with client auth");
+            let names = unsafe { aws_lc_sys::SSL_CTX_get_client_CA_list(cfg.ctx_ptr()) };
+            assert!(!names.is_null());
+            assert_eq!(unsafe { aws_lc_sys::OPENSSL_sk_num(names.cast()) }, 2);
+            let advertised = unsafe { aws_lc_sys::OPENSSL_sk_value(names.cast(), 0) };
+            let leaf = unsafe { aws_lc_sys::SSL_CTX_get0_certificate(cfg.ctx_ptr()) };
+            let subject = unsafe { aws_lc_sys::X509_get_subject_name(leaf) };
+            assert_eq!(
+                unsafe { aws_lc_sys::X509_NAME_cmp(advertised.cast(), subject) },
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn no_client_auth_does_not_advertise_ca_names() {
+        let cfg = ServerConfig::builder()
+            .with_der_bytes(&[TEST_CERT_DER], TEST_KEY_DER)
+            .expect("config should build without client auth");
+        let names = unsafe { aws_lc_sys::SSL_CTX_get_client_CA_list(cfg.ctx_ptr()) };
+        assert!(names.is_null() || unsafe { aws_lc_sys::OPENSSL_sk_num(names.cast()) } == 0);
     }
 
     #[test]

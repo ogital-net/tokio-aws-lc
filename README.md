@@ -156,8 +156,11 @@ tls.read_to_end(&mut body).await?;
 
 `TlsConnector::connect` accepts both DNS names and IP literals. DNS
 names go out as the SNI extension and are matched against the
-certificate's DNS SANs / CN; IP literals skip SNI (RFC 6066 Sec 3) and
-are matched against the certificate's iPAddress SANs.
+certificate's DNS SANs; IP literals skip SNI (RFC 6066 Sec 3) and
+are matched against the certificate's iPAddress SANs. Common Name fallback
+is disabled by default. For legacy DNS certificates without DNS SANs, opt in
+with `ClientConfig::builder().allow_common_name_fallback(true)`. This never
+overrides DNS SANs or allows Common Name matching for IP addresses.
 
 ### Mutual TLS and peer identity
 
@@ -186,6 +189,13 @@ encoding of the peer's leaf certificate, or `None` when no certificate was
 presented. It works on both client and server streams, including with kTLS.
 Clients present their identity using `with_client_auth_pem_bytes` or
 `with_client_auth_der_bytes` on `ClientConfigBuilder`.
+
+Server-side client authentication trusts only the supplied bundle, never
+system roots, and accepts at most five intermediate certificates (excluding
+the leaf and trust anchor). The configured roots' subject names are advertised
+in `CertificateRequest` to help clients select their certificates. Client-side
+server trust is configured independently; presenting a client certificate does
+not replace the client's trust roots.
 
 For enrolled self-signed clients, the trust bundle can contain the enrolled
 certificates themselves. A round-trip test covers a self-signed P-256 client

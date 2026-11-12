@@ -19,6 +19,7 @@ use super::{encode_alpn_wire, ProtocolVersion};
 pub struct ClientConfig {
     pub(crate) ctx: SslCtx,
     pub(crate) ktls_disabled: bool,
+    pub(crate) allow_common_name_fallback: bool,
 }
 
 // SAFETY: ClientConfig is logically immutable after construction. The
@@ -83,6 +84,7 @@ pub struct ClientConfigBuilder {
     min_version: Option<ProtocolVersion>,
     max_version: Option<ProtocolVersion>,
     client_auth: Option<ClientAuth>,
+    allow_common_name_fallback: bool,
     cipher_suites: Option<Vec<&'static CipherSuite>>,
     named_groups: Option<Vec<NamedGroup>>,
     ktls_disabled: bool,
@@ -112,6 +114,18 @@ impl ClientConfigBuilder {
     #[must_use]
     pub fn with_root_certs_der_bytes(mut self, certs: &[&[u8]]) -> Self {
         self.roots = Roots::Der(certs.iter().map(|c| c.to_vec()).collect());
+        self
+    }
+
+    /// Allow DNS names to match the certificate's Common Name when no
+    /// DNS subject alternative names are present. Disabled by default:
+    /// server identities must match subject alternative names (SANs).
+    ///
+    /// Enable only for legacy certificates. This does not allow a Common
+    /// Name to override DNS SANs or authenticate an IP-address literal.
+    #[must_use]
+    pub fn allow_common_name_fallback(mut self, allow: bool) -> Self {
+        self.allow_common_name_fallback = allow;
         self
     }
 
@@ -369,6 +383,7 @@ impl ClientConfigBuilder {
         Ok(ClientConfig {
             ctx,
             ktls_disabled: self.ktls_disabled,
+            allow_common_name_fallback: self.allow_common_name_fallback,
         })
     }
 }

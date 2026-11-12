@@ -35,10 +35,13 @@ impl TlsConnector {
     /// `server_name` is the peer identity to authenticate. It may be:
     ///
     /// - a DNS name (e.g. `"example.com"`): sent as SNI and matched
-    ///   against the certificate DNS SANs / CN; or
+    ///   against the certificate DNS SANs; or
     /// - an IP-address literal (e.g. `"10.0.0.5"`, `"2001:db8::1"`):
     ///   not sent as SNI (RFC 6066 Sec 3 keeps IPs out of SNI) and
     ///   matched against the certificate IP SANs.
+    ///
+    /// Common Name fallback for DNS names is disabled unless explicitly
+    /// enabled with [`crate::ClientConfigBuilder::allow_common_name_fallback`].
     ///
     /// Both checks happen inside libssl as part of the handshake; a
     /// mismatch fails the handshake with a verification error. Disabling
@@ -60,12 +63,22 @@ impl TlsConnector {
         }
         let mut ssl = new_ssl(&self.cfg)?;
 
+        if !self.cfg.allow_common_name_fallback {
+            #[allow(clippy::cast_sign_loss)]
+            unsafe {
+                aws_lc_sys::SSL_set_hostflags(
+                    ssl.as_ptr(),
+                    aws_lc_sys::X509_CHECK_FLAG_NEVER_CHECK_SUBJECT as u32,
+                );
+            }
+        }
+
         let name_c = CString::new(server_name)
             .map_err(|_| Error::Init("server_name contains an embedded NUL byte".into()))?;
 
         // RFC 6066 Sec 3: SNI carries DNS names only. Route IP literals
         // through IP SAN checks; all other names use SNI plus
-        // DNS-SAN/CN checks.
+        // DNS SAN checks, with CN fallback only when explicitly enabled.
         match server_name.parse::<IpAddr>() {
             Ok(_) => {
                 // SAFETY: ssl is fresh; SSL_get0_param returns a
