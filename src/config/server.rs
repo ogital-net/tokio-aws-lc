@@ -27,6 +27,8 @@ const MAX_CERT_DEPTH: c_int = 5;
 pub struct ServerConfig {
     pub(crate) ctx: SslCtx,
     pub(crate) ktls_disabled: bool,
+    cipher_lists: (Option<CString>, Option<CString>),
+    named_groups: Vec<c_int>,
     // ALPN wire-format buffer (if any) is owned by the SSL_CTX itself
     // via ex_data; see [`alpn_ex_index`] / [`alpn_ex_free`]. The buffer
     // is allocated as `Box<Vec<u8>>` and freed by AWS-LC when
@@ -51,6 +53,79 @@ impl ServerConfig {
     /// to create per-connection `SSL` handles.
     pub(crate) fn ctx_ptr(&self) -> *mut aws_lc_sys::SSL_CTX {
         self.ctx.as_ptr()
+    }
+
+    /// Apply this policy to a connection created from a neutral server context.
+    ///
+    /// # Safety
+    ///
+    /// `ssl` is live and paused in the early certificate-selection callback.
+    /// No other configuration has been applied to it.
+    pub(crate) unsafe fn apply_to_ssl(&self, ssl: *mut aws_lc_sys::SSL) -> Result<()> {
+        let ctx = self.ctx_ptr();
+        unsafe {
+            if aws_lc_sys::SSL_set_SSL_CTX(ssl, ctx).is_null() {
+                return Err(Error::Init(format!("SSL_set_SSL_CTX: {}", last_error())));
+            }
+            aws_lc_sys::SSL_clear_options(ssl, aws_lc_sys::SSL_get_options(ssl));
+            aws_lc_sys::SSL_set_options(ssl, aws_lc_sys::SSL_CTX_get_options(ctx));
+            if aws_lc_sys::SSL_set_min_proto_version(
+                ssl,
+                aws_lc_sys::SSL_CTX_get_min_proto_version(ctx),
+            ) != 1
+                || aws_lc_sys::SSL_set_max_proto_version(
+                    ssl,
+                    aws_lc_sys::SSL_CTX_get_max_proto_version(ctx),
+                ) != 1
+                || aws_lc_sys::SSL_set1_verify_cert_store(
+                    ssl,
+                    aws_lc_sys::SSL_CTX_get_cert_store(ctx),
+                ) != 1
+            {
+                return Err(Error::Init(format!(
+                    "applying SNI TLS policy: {}",
+                    last_error()
+                )));
+            }
+            aws_lc_sys::SSL_set_verify(ssl, aws_lc_sys::SSL_CTX_get_verify_mode(ctx), None);
+            aws_lc_sys::SSL_set_verify_depth(ssl, aws_lc_sys::SSL_CTX_get_verify_depth(ctx));
+            let names = aws_lc_sys::SSL_CTX_get_client_CA_list(ctx);
+            let copy = if names.is_null() {
+                ptr::null_mut()
+            } else {
+                aws_lc_sys::SSL_dup_CA_list(names)
+            };
+            if !names.is_null() && copy.is_null() {
+                return Err(Error::Init(format!("SSL_dup_CA_list: {}", last_error())));
+            }
+            aws_lc_sys::SSL_set_client_CA_list(ssl, copy);
+            if let Some(list) = &self.cipher_lists.0 {
+                if aws_lc_sys::SSL_set_cipher_list(ssl, list.as_ptr()) != 1 {
+                    return Err(Error::Init(format!(
+                        "SSL_set_cipher_list: {}",
+                        last_error()
+                    )));
+                }
+            }
+            if let Some(list) = &self.cipher_lists.1 {
+                if aws_lc_sys::SSL_set_ciphersuites(ssl, list.as_ptr()) != 1 {
+                    return Err(Error::Init(format!(
+                        "SSL_set_ciphersuites: {}",
+                        last_error()
+                    )));
+                }
+            }
+            if !self.named_groups.is_empty()
+                && aws_lc_sys::SSL_set1_groups(
+                    ssl,
+                    self.named_groups.as_ptr(),
+                    self.named_groups.len(),
+                ) != 1
+            {
+                return Err(Error::Init(format!("SSL_set1_groups: {}", last_error())));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -376,9 +451,26 @@ impl ServerConfigBuilder {
             }
         }
 
+        let (tls12, tls13) = if let Some(suites) = &self.cipher_suites {
+            cipher_suite::split_for_aws_lc(suites)
+        } else {
+            (
+                self.ktls_aead_only
+                    .then(|| "ECDHE+AESGCM:ECDHE+CHACHA20".into()),
+                None,
+            )
+        };
+        let to_cstring = |list: String| CString::new(list).expect("cipher names contain no NUL");
         Ok(ServerConfig {
             ctx,
             ktls_disabled: self.ktls_disabled,
+            cipher_lists: (tls12.map(to_cstring), tls13.map(to_cstring)),
+            named_groups: self
+                .named_groups
+                .unwrap_or_default()
+                .into_iter()
+                .map(NamedGroup::nid)
+                .collect(),
         })
     }
 }
@@ -782,6 +874,17 @@ mod tests {
     const TEST_CERT_DER: &[u8] = include_bytes!("../../tests/data/cert.der");
     const TEST_KEY_DER: &[u8] = include_bytes!("../../tests/data/key.der");
 
+    fn ssl_with_policy(cfg: &ServerConfig) -> crate::ffi::Ssl {
+        let neutral = new_server_ctx().unwrap();
+        let ssl =
+            unsafe { crate::ffi::Ssl::from_raw(aws_lc_sys::SSL_new(neutral.as_ptr())) }.unwrap();
+        unsafe {
+            aws_lc_sys::SSL_set_accept_state(ssl.as_ptr());
+            cfg.apply_to_ssl(ssl.as_ptr()).unwrap();
+        }
+        ssl
+    }
+
     #[test]
     fn client_auth_limits_certificate_verification_depth() {
         for mode in [ClientAuthMode::Optional, ClientAuthMode::Required] {
@@ -791,6 +894,12 @@ mod tests {
                 .expect("config should build with client auth");
             let depth = unsafe { aws_lc_sys::SSL_CTX_get_verify_depth(cfg.ctx_ptr()) };
             assert_eq!(depth, 5, "unexpected verification depth for {mode:?}");
+            let ssl = ssl_with_policy(&cfg);
+            assert_eq!(unsafe { aws_lc_sys::SSL_get_verify_depth(ssl.as_ptr()) }, 5);
+            assert_eq!(
+                unsafe { aws_lc_sys::SSL_get_verify_mode(ssl.as_ptr()) },
+                unsafe { aws_lc_sys::SSL_CTX_get_verify_mode(cfg.ctx_ptr()) }
+            );
         }
     }
 
@@ -813,6 +922,22 @@ mod tests {
                 unsafe { aws_lc_sys::X509_NAME_cmp(advertised.cast(), subject) },
                 0
             );
+            let ssl = ssl_with_policy(&cfg);
+            let selected_names = unsafe { aws_lc_sys::SSL_get_client_CA_list(ssl.as_ptr()) };
+            assert!(!selected_names.is_null());
+            assert_ne!(selected_names, names);
+            assert_eq!(
+                unsafe { aws_lc_sys::OPENSSL_sk_num(selected_names.cast()) },
+                2
+            );
+            for index in 0..2 {
+                let expected = unsafe { aws_lc_sys::OPENSSL_sk_value(names.cast(), index) };
+                let actual = unsafe { aws_lc_sys::OPENSSL_sk_value(selected_names.cast(), index) };
+                assert_eq!(
+                    unsafe { aws_lc_sys::X509_NAME_cmp(expected.cast(), actual.cast()) },
+                    0
+                );
+            }
         }
     }
 

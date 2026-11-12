@@ -44,7 +44,7 @@ using AWS-LC's TLS engine. It is not.
   exposes a ring-compatible API on top of `aws-lc-sys` so rustls can
   swap providers; nothing in `libssl` is reachable from there.
 - **`tokio-aws-lc`** uses AWS-LC's `libssl`. The TLS state machine,
-  record layer, handshake, X.509 chain validation, SNI matching, and
+  record layer, handshake, X.509 chain validation, hostname verification, and
   ALPN selection all live in AWS-LC; this crate is a Tokio adapter
   layered on `SSL_CTX` / `SSL` / `BIO`. The `ServerConfig` and
   `ClientConfig` builders are thin wrappers that translate typed
@@ -64,7 +64,7 @@ Pre-release (`0.4.0`).
 
 | Surface | State |
 | --- | --- |
-| Server (`TlsAcceptor`, `ServerConfig`) | Round-trip tested against `openssl s_client` and against this crate's client. |
+| Server (`TlsAcceptor`, `ServerConfig`) | SNI configuration selection, mTLS, ALPN; round-trip tested against `openssl s_client` and this crate's client. |
 | Client (`TlsConnector`, `ClientConfig`) | PEM / system trust roots, SNI, IP-SAN, mTLS, ALPN. |
 | Linux kTLS (`TLS_TX` + `TLS_RX`) | TLS 1.3 (AES-128/256-GCM, ChaCha20-Poly1305) and TLS 1.2 AEAD; integration-tested via `/proc/net/tls_stat`. |
 | Optional `hyper` integration | Server acceptor + `tower::Service<Uri>` client connector for `hyper` 1.x. |
@@ -125,6 +125,47 @@ loop {
 }
 # }
 ```
+
+### Server-side SNI
+
+Select a configuration before certificate selection and client authentication:
+
+```rust,no_run
+use std::sync::Arc;
+use tokio_aws_lc::{ServerConfig, TlsAcceptor};
+
+# fn configure() -> Result<(), Box<dyn std::error::Error>> {
+let first = Arc::new(ServerConfig::builder()
+  .with_pem_files("first.pem".as_ref(), "first-key.pem".as_ref())?);
+let second = Arc::new(ServerConfig::builder()
+  .with_pem_files("second.pem".as_ref(), "second-key.pem".as_ref())?);
+let acceptor = TlsAcceptor::with_sni_resolver(move |name| match name {
+  Some("first.example") => Some(Arc::clone(&first)),
+  Some("second.example") => Some(Arc::clone(&second)),
+  _ => None,
+})?;
+# Ok(())
+# }
+```
+
+The resolver receives an ASCII-lowercased DNS name, or `None` when the client
+omits SNI. Returning `None` rejects the handshake. To allow unknown or missing
+SNI, explicitly return a default configuration in the fallback arm. There is
+no automatic wildcard matching or IDNA conversion; non-ASCII names are rejected.
+The resolver runs synchronously, must not block, and can be called concurrently.
+It should look up prebuilt `Arc<ServerConfig>` values rather than load files.
+Resolver panics reject the connection when panic unwinding is enabled.
+
+The chosen configuration controls the certificate, TLS version bounds,
+ciphers, key-exchange groups, ALPN, client authentication (including its private
+trust roots, advertised CA names, and depth limit), and kTLS enablement.
+Connections start from a neutral context, not another host's configuration.
+Session resumption remains disabled. `TlsAcceptor::new(config)` continues to
+serve a single configuration without requiring SNI.
+
+`tls.negotiated().sni()` reports the received name on servers and the configured
+name on clients, preserving its original spelling. SNI is client-supplied
+routing input, not an authenticated client identity.
 
 ### Client
 

@@ -73,7 +73,7 @@ impl KtlsEligibility {
 /// Negotiated parameters of an established session.
 ///
 /// Snapshot of what the handshake settled on: protocol version, cipher
-/// suite name, ALPN selection (if any), and SNI (server side only).
+/// suite name, ALPN selection (if any), and SNI.
 /// Cheap to construct; obtained via [`crate::TlsStream::negotiated`].
 #[derive(Debug, Clone)]
 pub struct NegotiatedSession {
@@ -105,8 +105,8 @@ impl NegotiatedSession {
         self.alpn.as_deref()
     }
 
-    /// SNI value sent by the client, if any. Always `None` on the client
-    /// side.
+    /// SNI hostname received by a server or configured by a client, if any.
+    /// This client-supplied name is not an authenticated client identity.
     #[must_use]
     pub fn sni(&self) -> Option<&str> {
         self.sni.as_deref()
@@ -153,8 +153,7 @@ impl NegotiatedSession {
             Some(slice.to_vec())
         };
 
-        // SNI (server side): SSL_get_servername with TLSEXT_NAMETYPE_host_name.
-        // Returns null on the client side or when the client sent no SNI.
+        // SSL_get_servername returns received SNI on servers and configured SNI on clients.
         // SAFETY: ssl is live; the type constant is a scalar.
         let sni_ptr = unsafe {
             aws_lc_sys::SSL_get_servername(ssl, aws_lc_sys::TLSEXT_NAMETYPE_host_name as c_int)
